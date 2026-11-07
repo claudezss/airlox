@@ -807,6 +807,10 @@ pub struct Session {
     asked: HashSet<String>,
     /// Evicted items back on the relay, to fetch.
     reseeded: HashSet<String>,
+    /// Blob hashes the relay gave with item events, checked against the
+    /// author's signature: an item this client never fetched still has an
+    /// exact reference (which doc chains need).
+    digests: HashMap<String, String>,
     unacked: HashSet<String>,
     last_seq: Option<u64>,
     /// When this client last heard from the relay: a sync that went through,
@@ -947,6 +951,7 @@ impl Session {
             wanted: HashMap::new(),
             asked: HashSet::new(),
             reseeded: HashSet::new(),
+            digests: HashMap::new(),
             unacked: HashSet::new(),
             last_seq: None,
             synced_at_ms: None,
@@ -2014,6 +2019,16 @@ impl Session {
             }
             "item" => {
                 if let Some(env) = data["envelope"].as_str() {
+                    if let Some(sha) = data["blob_sha256"].as_str() {
+                        if api::item_ref_from_digest(env, sha).is_ok() {
+                            if let Some(id) = serde_json::from_str::<Value>(env)
+                                .ok()
+                                .and_then(|v| v["header"]["id"].as_str().map(String::from))
+                            {
+                                self.digests.insert(id, sha.to_string());
+                            }
+                        }
+                    }
                     out = self.receive(seq, env.to_string(), fetch).await?;
                 }
             }
@@ -2140,7 +2155,7 @@ impl Session {
             author_name: author.as_ref().map(|a| a.display_name.clone()),
             created_at_ms: h["created_at_ms"].as_u64().unwrap_or(0),
             refs: h["refs"].clone(),
-            item_ref: json!({"id": id, "blob_sha256": ""}),
+            item_ref: json!({"id": id, "blob_sha256": self.digests.get(&id).cloned().unwrap_or_default()}),
             meta: None,
             body: vec![],
             status: Status::Ok,

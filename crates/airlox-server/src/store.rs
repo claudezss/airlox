@@ -559,11 +559,13 @@ impl Inner {
                 self.transfer_bytes += blob_len;
                 self.usage.add(ip_hash.as_deref(), *blob_len);
                 self.last_activity_ms = self.last_activity_ms.max(ts);
-                Ok(self.push_event(
-                    line.seq,
-                    "item",
-                    json!({"envelope": envelope, "blob_len": blob_len, "blob_present": true}),
-                ))
+                // The blob's hash, which the author's signature covers: a client
+                // that never gets the blob still knows exactly which item this is.
+                let mut data = json!({"envelope": envelope, "blob_len": blob_len, "blob_present": true});
+                if let Some(sha) = blob_sha256 {
+                    data["blob_sha256"] = json!(sha);
+                }
+                Ok(self.push_event(line.seq, "item", data))
             }
             Rec::Ack { item, by } => {
                 if let Some(r) = self.items.get_mut(item) {

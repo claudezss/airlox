@@ -79,7 +79,7 @@ impl Session {
             }
             let Some(env) = self.envelopes.get(&it.id) else { continue };
             let Ok(env) = parse_canonical::<ItemEnvelope>(env, "item envelope") else { continue };
-            let Some(sha) = it.item_ref["blob_sha256"].as_str() else { continue };
+            let Some(sha) = it.item_ref["blob_sha256"].as_str().filter(|s| !s.is_empty()) else { continue };
             let _ = ix.apply(&env.header, sha, it.author_role.as_deref() == Some("owner"), it.seq);
         }
         ix

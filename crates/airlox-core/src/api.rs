@@ -167,6 +167,16 @@ pub fn item_ref(envelope_json: &str, blob: &[u8]) -> Result<String> {
     json(&ItemRef::to(&s))
 }
 
+/// Check that `blob_sha256` (base64url) is the hash of the blob the
+/// envelope's author signed, without the blob: what a relay says about an
+/// item it no longer holds. Returns the item reference.
+pub fn item_ref_from_digest(envelope_json: &str, blob_sha256: &str) -> Result<String> {
+    let env: ItemEnvelope = crate::encoding::parse_canonical(envelope_json, "item envelope")?;
+    let digest = crate::encoding::b64d_32(blob_sha256)?;
+    env.verify_blob_digest(env.header.blob_len()?, &digest)?;
+    json(&ItemRef { id: env.header.id.clone(), blob_sha256: blob_sha256.to_string() })
+}
+
 pub fn verify_item(envelope_json: &str, blob: &[u8]) -> Result<()> {
     sealed(envelope_json, blob)?.verify()
 }
