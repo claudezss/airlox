@@ -311,3 +311,64 @@ pub fn transfer_open(code: &str, sealed_box: &str) -> Result<String> {
     Invite::parse(&invite)?;
     Ok(invite)
 }
+
+// ------------------------------------------------------------------ docs --
+
+/// One `doc` item as a client knows it, for [`doc_index`].
+#[derive(Deserialize)]
+struct DocEntry {
+    envelope: String,
+    blob_sha256: String,
+    /// Whether the author holds the owner role.
+    owner: bool,
+    seq: u64,
+}
+
+/// The session's docs from its `doc` items (`entries_json`: a JSON list of
+/// `{envelope, blob_sha256, owner, seq}`, in relay order, from owners and
+/// senders only). Returns `[{id, meta: chain, tabs: [chain]}]`, each chain
+/// `{id, versions: [{id, blob_sha256, author, owner, seq, created_at_ms,
+/// stamp}]}` with tabs in creation order. Entries that do not apply are
+/// left out, as the relay left them out.
+pub fn doc_index(entries_json: &str) -> Result<String> {
+    let entries: Vec<DocEntry> = serde_json::from_str(entries_json)?;
+    let mut ix = crate::doc::DocIndex::default();
+    for e in entries {
+        let Ok(env) = parse_canonical::<ItemEnvelope>(&e.envelope, "item envelope") else { continue };
+        if env.header.kind != crate::item::ItemKind::Doc {
+            continue;
+        }
+        let _ = ix.apply(&env.header, &e.blob_sha256, e.owner, e.seq);
+    }
+    let chain = |c: &crate::doc::Chain| {
+        serde_json::json!({
+            "id": c.id,
+            "versions": c.versions.iter().enumerate().map(|(i, v)| serde_json::json!({
+                "id": v.item.id, "blob_sha256": v.item.blob_sha256, "author": v.author.to_b64(),
+                "owner": v.owner, "seq": v.seq, "created_at_ms": v.created_at_ms, "stamp": c.stamp_at(i),
+            })).collect::<Vec<_>>(),
+        })
+    };
+    let docs: Vec<serde_json::Value> = ix
+        .docs()
+        .map(|d| serde_json::json!({"id": d.id(), "meta": chain(&d.meta), "tabs": d.tabs.iter().map(chain).collect::<Vec<_>>()}))
+        .collect();
+    json(&docs)
+}
+
+/// Check a doc payload's meta (`doc_root`, `doc_meta` or `doc_tab` JSON)
+/// before sending it.
+pub fn doc_check(meta_json: &str) -> Result<()> {
+    match serde_json::from_str::<Meta>(meta_json)? {
+        Meta::DocRoot(d) | Meta::DocMeta(d) => crate::doc::check_info(&d),
+        Meta::DocTab(t) => crate::doc::check_tab(&t),
+        _ => Err(Error::invalid("doc", "not a doc payload")),
+    }
+}
+
+/// A line diff of two texts: a JSON list of `[" " | "-" | "+", line]`.
+pub fn line_diff(a: &str, b: &str) -> Result<String> {
+    let d: Vec<(String, &str)> =
+        crate::doc::line_diff(a, b).into_iter().map(|(k, l)| (k.to_string(), l)).collect();
+    json(&d)
+}

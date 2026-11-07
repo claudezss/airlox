@@ -32,6 +32,7 @@ const TYPE_LABELS = [
   ["py", "python", ".py"],
   ["zip", "zip", ".zip"],
   ["image", "image", ".png .jpg .webp"],
+  ["doc", "docs", "shared tabs"],
 ];
 
 // ---------- DOM helpers (no innerHTML: all content is untrusted) ----------
@@ -259,6 +260,10 @@ const hostOf = (u) => {
 };
 // Returns an array of nodes: the link, or just its text when the scheme is not allowed.
 function mdLink(href, kids, bare = false) {
+  if (mdLinkHook) {
+    const hooked = mdLinkHook(href, kids);
+    if (hooked) return hooked;
+  }
   if (!SAFE_URL.test(href)) return kids;
   const host = hostOf(href);
   // Always say where a link really goes, unless its own text is a link to the same host.
@@ -920,6 +925,7 @@ const NEW_ICONS = {
   py: ["M9 8l-4 4 4 4", "M15 8l4 4-4 4", "M13 6l-2 12"],
   zip: ["M5 3h14v18H5z", "M12 3v2M12 7v2M12 11v2", "M10.5 15h3v3h-3z"],
   image: ["M3 5h18v14H3z", "M3 16l5-5 4 4 3-3 6 6", "M15 9h.01"],
+  doc: ["M4 7h16v13H4z", "M4 7l2-3h5l2 3", "M7 12h10M7 15h7"],
 };
 const TTL_WORDS = { 900000: "15 minutes", 3600000: "1 hour", 86400000: "24 hours", never: "until closed" };
 
@@ -1658,8 +1664,9 @@ function buildSessionLayout(s) {
     } }, "Review runners"));
   const jumpText = el("span", {});
   const jump = el("button", { class: "jump", type: "button", "aria-label": "Jump to latest" }, svg(I_DOWN, 16), jumpText);
+  const docPane = buildDocView(s, { mainParts: [scroller, jump, dockSlot] });
   const session = el("div", { class: "session" }, el("h1", { class: "sr-only" }, `Session ${sid.slice(0, 7)}, ${manifest.mode} mode, ${inv.role}`),
-    el("div", { class: "main-col" }, approvalBanner, banner, scroller, jump, dockSlot), rail);
+    el("div", { class: "main-col" }, approvalBanner, banner, scroller, jump, dockSlot, docPane), rail);
   // Tapping the timeline closes the drawer.
   session.querySelector(".main-col").addEventListener("pointerdown", () => narrow.matches && railOpen() && setRail(false));
   show(session);
@@ -1864,6 +1871,7 @@ function buildSessionLayout(s) {
           p.description ? el("div", { class: "desc", title: "Their own description, not verified" }, el("span", { class: "claim" }, "says "), p.description) : null),
         el("span", { class: "key", title: "Key fingerprint" }, ac.fingerprint(p.participant_pub).slice(0, 4))))),
     item: (it) => {
+      if (it.kind === "doc") docChanged(s, it);
       // Was the reader at the end before this change? (Measured before anything moves.)
       const was = atBottom() || following();
       // Files an accepted result lists live only inside that result.
@@ -2006,6 +2014,16 @@ async function applyEvent(s, ev, { fetch, record, batch = false }) {
       console.warn("ignoring unverifiable participant", e);
     }
   } else if (ev.kind === "item") {
+    // The relay's hash of the blob, checked against the author's signature:
+    // an item this browser never gets still has an exact reference.
+    if (ev.data.blob_sha256) {
+      try {
+        const ref = JSON.parse(ac.itemRefFromDigest(ev.data.envelope, ev.data.blob_sha256));
+        (s.digests ??= new Map()).set(ref.id, ref);
+      } catch {
+        // A hash that does not match the signature is ignored.
+      }
+    }
     await receive(s, ev.seq, ev.data.envelope, fetch);
   } else if (ev.kind === "evicted") {
     s.evicted.add(ev.data.item);
@@ -2184,7 +2202,7 @@ async function receive(s, seq, envelope, fetchBlob, attempt = 0) {
   const author = s.participants.get(h.author);
   const it = { seq, id: h.id, kind: h.kind, subkind: h.subkind, author: h.author, created: h.created_at_ms,
     authorName: author?.display_name || "unknown", role: author?.role, status: "ok", envelope,
-    refs: Array.isArray(h.refs) ? h.refs : [] };
+    refs: Array.isArray(h.refs) ? h.refs : [], ref: s.digests?.get(h.id) };
   s.items.set(h.id, it);
   if (!author) {
     Object.assign(it, { status: "rejected", error: "The author is not a verified member of this session." });
@@ -2432,6 +2450,7 @@ function decorate(s, it, node) {
 }
 
 function itemNode(s, it) {
+  if (it.kind === "doc") return docPill(s, it);
   const label = it.kind === "file" ? it.subkind : it.kind;
   const mine = it.author === s.me;
   const card = el("div", { class: "card" });
@@ -2984,6 +3003,745 @@ function renderEvent(s, it) {
     el("div", { class: "pill" }, suspect ? [sym("✕ "), `ignored: ${text} (not from the owner)`] : text, " · ", hhmm(it.created)));
 }
 
+// ---------- shared docs ----------
+// A doc is a title and tabs of Markdown; every save is a new version of one
+// tab (docs/design/docs.md §0). Which version is current comes from the
+// core (ac.docIndex) over item headers in relay order, the same rule the
+// relay and the CLI use. A save names the version it started from: if the
+// tab moved on, nothing is posted and the editor offers to merge.
+const DOC_MAX_MD = 256 * 1024;
+const DOC_UNTRUSTED = "Written by participants. Only the owner's text sets the plan.";
+
+function docState(s) {
+  return (s.doc ??= { view: "chat", sel: null, tab: null, mode: "read", hist: null, drafts: new Map(), merging: null,
+    remote: null, since: null, model: null, seen: docSeenLoad(s), feedAll: false });
+}
+
+const docSeenKey = (s) => `airlox-doc-seen:${s.sid}:${s.inv.role}`;
+function docSeenLoad(s) {
+  try {
+    return JSON.parse(localStorage.getItem(docSeenKey(s)) || "{}");
+  } catch {
+    return {};
+  }
+}
+function docSeen(s, chain, versionId) {
+  const d = docState(s);
+  d.seen[chain] = versionId;
+  try {
+    localStorage.setItem(docSeenKey(s), JSON.stringify(d.seen));
+  } catch {
+    // Private windows may refuse storage: "since you looked" just resets.
+  }
+}
+
+// The content of a version this browser opened and checked, if any.
+function docContent(s, v) {
+  const it = s.items.get(v.id);
+  if (!it || it.status !== "ok" || it.ref?.blob_sha256 !== v.blob_sha256) return null;
+  return it.meta;
+}
+
+function docModel(s) {
+  const entries = [...s.items.values()]
+    .filter((it) => it.kind === "doc" && (it.role === "owner" || it.role === "sender") && it.ref?.blob_sha256)
+    .sort((a, b) => a.seq - b.seq)
+    .map((it) => ({ envelope: it.envelope, blob_sha256: it.ref.blob_sha256, owner: it.role === "owner", seq: it.seq }));
+  let docs = [];
+  try {
+    docs = JSON.parse(ac.docIndex(JSON.stringify(entries)));
+  } catch (e) {
+    console.warn("doc index failed", e);
+  }
+  return docs.map((d) => {
+    const head = (c) => c.versions[c.versions.length - 1];
+    const info = docContent(s, head(d.meta));
+    const order = [];
+    for (const id of info?.order || []) {
+      const t = d.tabs.find((x) => x.id === id);
+      if (t && !order.includes(t)) order.push(t);
+    }
+    for (const t of d.tabs) if (!order.includes(t)) order.push(t);
+    const tabs = order.map((c) => ({ id: c.id, chain: c, head: head(c), content: docContent(s, head(c)) }));
+    const changed = Math.max(...[d.meta, ...d.tabs].map((c) => head(c).seq));
+    return { id: d.id, root: { id: d.meta.versions[0].id, blob_sha256: d.meta.versions[0].blob_sha256 },
+      meta: d.meta, metaHead: head(d.meta), title: info?.title ?? null, tabs, changed };
+  });
+}
+
+const docRef = (v) => ({ id: v.id, blob_sha256: v.blob_sha256 });
+const tabLive = (t) => !t.content?.deleted;
+const tabName = (t) => t.content?.name ?? "Unreadable tab";
+const docAgo = (ms) => {
+  const sec = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  return sec < 60 ? "just now" : sec < 3600 ? `${Math.floor(sec / 60)} min ago` : sec < 86400 ? `${Math.floor(sec / 3600)} h ago` : `${Math.floor(sec / 86400)} d ago`;
+};
+const docUnseen = (s, t) => {
+  const seen = docState(s).seen[t.id];
+  const i = t.chain.versions.findIndex((v) => v.id === seen);
+  return t.chain.versions.length - 1 - i;
+};
+
+// Called whenever a doc item arrives or changes state.
+function docChanged(s, it) {
+  const d = docState(s);
+  const before = d.model;
+  d.model = docModel(s);
+  if (!s.docUi) return;
+  s.docUi.badge();
+  if (d.view !== "doc") return;
+  const doc = docCurrent(s);
+  const t = doc && docTab(s, doc);
+  if (d.mode === "edit") return s.docUi.refreshEdit();
+  // A reader keeps their place: a new version of the open tab is offered, not swapped in.
+  const prevTab = before && doc && before.find((x) => x.id === doc.id)?.tabs.find((x) => x.id === t?.id);
+  if (d.mode === "read" && t && prevTab && prevTab.head.id !== t.head.id && it?.author !== s.me) {
+    d.remote = { shown: prevTab.head };
+  }
+  s.docUi.render();
+}
+
+function docCurrent(s) {
+  const d = docState(s);
+  const docs = d.model || [];
+  return docs.find((x) => x.id === d.sel) || docs.slice().sort((a, b) => b.changed - a.changed)[0] || null;
+}
+function docTab(s, doc) {
+  const d = docState(s);
+  return doc.tabs.find((t) => t.id === d.tab) || doc.tabs.find(tabLive) || doc.tabs[0] || null;
+}
+
+// Post a doc item and wait until it is back from the relay, so the model has it.
+async function docPost(s, subkind, refs, meta) {
+  try {
+    ac.docCheck(JSON.stringify(meta));
+  } catch (e) {
+    throw new Error(String(e.message || e).replace(/^\w+Error: /, ""));
+  }
+  const id = await sendPayload(s, "doc", subkind, meta, new Uint8Array(), { refs });
+  for (let i = 0; i < 50 && !s.items.get(id)?.ref; i++) await new Promise((r) => setTimeout(r, 100));
+  return id;
+}
+
+// The pill a doc save leaves in the timeline.
+function docPill(s, it) {
+  const m = it.status === "ok" ? it.meta : null;
+  const what = !m ? "saved a doc version" : m.type === "doc_root" ? `created the doc “${m.title}”` : m.type === "doc_meta"
+    ? `retitled or reordered the doc` : `${m.deleted ? "deleted" : "saved"} tab ${m.name}${m.note ? ` · “${clip(m.note, 80)}”` : ""}`;
+  return el("article", { class: "item evline", id: `item-${it.id}` },
+    el("div", { class: "pill" }, `${it.authorName} ${what} · ${hhmm(it.created)} · `,
+      el("button", { type: "button", class: "linkish", onclick: () => s.docUi?.open(m?.type === "doc_tab" ? it.id : null) }, "Open doc")));
+}
+
+// The verified chip for an `airlox:result/<id>.<hash>` link: drawn from the
+// signed result, never from the link text.
+function docResultChip(s, href) {
+  const m = href.match(/^airlox:result\/([A-Za-z0-9_-]{22})\.([A-Za-z0-9_-]{43})$/);
+  const r = m && s.items.get(m[1]);
+  const first = r && (s.results.get(r.meta?.job?.id) || []).find((x) => x.status === "ok" && resultCheck(s, x).ok && !resultCheck(s, x).unbound);
+  const ok = r && r.kind === "result" && r.status === "ok" && r.ref?.blob_sha256 === m[2] && first?.id === r.id;
+  if (!ok) {
+    return [el("span", { class: "rchip unverified", title: "This link does not match a verified result in this session. What the tab says about it is unchecked." },
+      sym("? "), "unverified result")];
+  }
+  const job = s.items.get(r.meta.job.id);
+  const o = outcome(r.meta);
+  const runner = s.participants.get(r.author)?.display_name || "runner";
+  const what = job?.meta?.filename || "job";
+  const secs = Number.isFinite(r.meta.wall_ms) ? ` · ${(r.meta.wall_ms / 1000).toFixed(r.meta.wall_ms < 10000 ? 1 : 0)} s` : "";
+  return [el("button", { type: "button", class: `rchip ${o.bad ? "fail" : "pass"}`,
+    title: `${what} · signed by ${runner} (approved). Proves the run happened, not that it belongs to this task. Click to see it in Chat.`,
+    onclick: () => {
+      s.docUi.chat();
+      document.getElementById(`item-${job ? job.id : r.id}`)?.scrollIntoView({ block: "center" });
+    } }, sym(o.bad ? "✕ " : "✓ "), `${o.text} · ${runner}${secs}`)];
+}
+
+let mdLinkHook = null;
+// Render a tab's Markdown; checkboxes tick (when `onTick`) and result links become chips.
+function docMarkdown(s, md, onTick) {
+  mdLinkHook = (href) => (href.startsWith("airlox:result/") ? docResultChip(s, href) : null);
+  let nodes;
+  try {
+    nodes = markdown(md);
+  } finally {
+    mdLinkHook = null;
+  }
+  const box = el("div", { class: "md doc-md" }, nodes);
+  if (onTick) {
+    // Task lines in source order, outside code fences: the same order as the checkboxes.
+    const lines = md.split("\n");
+    const tasks = [];
+    let fence = null;
+    lines.forEach((l, i) => {
+      const f = l.match(/^\s{0,3}(```+|~~~+)/);
+      if (f) fence = fence ? (l.trimStart().startsWith(fence) ? null : fence) : f[1];
+      else if (!fence && /^\s*([-*+]|\d{1,9}[.)])\s+\[[ xX]\]\s+/.test(l)) tasks.push(i);
+    });
+    box.querySelectorAll('input[type="checkbox"]').forEach((cb, k) => {
+      if (tasks[k] === undefined) return;
+      const label = cb.parentElement?.textContent.trim() || "task";
+      cb.disabled = false;
+      cb.setAttribute("aria-label", clip(label, 80));
+      cb.addEventListener("change", () => {
+        const next = lines.slice();
+        next[tasks[k]] = next[tasks[k]].replace(/\[[ xX]\]/, cb.checked ? "[x]" : "[ ]");
+        onTick(next.join("\n"), `${cb.checked ? "Done" : "Reopened"}: ${clip(label, 60)}`, cb);
+      });
+    });
+  }
+  return box;
+}
+
+function docDiff(a, b) {
+  let rows;
+  try {
+    rows = JSON.parse(ac.lineDiff(a, b));
+  } catch {
+    rows = [];
+  }
+  if (!rows.some(([k]) => k !== " ")) return el("div", { class: "diff" }, el("div", { class: "ctx" }, "  (no change to the text)"));
+  const changed = (j) => !!rows[j] && rows[j][0] !== " ";
+  const keep = rows.map(([k], i) => k !== " " || changed(i - 1) || changed(i + 1));
+  const out = [];
+  let gap = false;
+  rows.forEach(([k, l], i) => {
+    if (keep[i]) {
+      out.push(el("div", { class: k === "+" ? "add" : k === "-" ? "del" : "ctx" },
+        el("span", { class: "sr-only" }, k === "+" ? "added: " : k === "-" ? "removed: " : ""), `${k === " " ? " " : k === "-" ? "−" : "+"} ${l}`));
+      gap = false;
+    } else if (!gap) {
+      out.push(el("div", { class: "ctx" }, "  ⋯"));
+      gap = true;
+    }
+  });
+  return el("div", { class: "diff", tabindex: 0 }, out);
+}
+
+function buildDocView(s, { mainParts, railSet }) {
+  const d = docState(s);
+  const canWrite = ["owner", "sender"].includes(s.inv.role);
+  const pane = el("div", { class: "docv", hidden: true });
+  const status = el("p", { class: "status", role: "alert" });
+  const say = (msg) => {
+    status.textContent = msg || "";
+  };
+  const views = el("nav", { class: "views", "aria-label": "Session view" });
+  const chatLink = el("button", { type: "button", "aria-pressed": "true" }, "Chat");
+  const docCount = el("span", { class: "n" });
+  const docLink = el("button", { type: "button", "aria-pressed": "false" }, "Doc", docCount);
+  views.append(chatLink, docLink);
+  document.getElementById("title").after(views);
+
+  const setView = (v) => {
+    d.view = v;
+    chatLink.setAttribute("aria-pressed", String(v === "chat"));
+    docLink.setAttribute("aria-pressed", String(v === "doc"));
+    pane.hidden = v !== "doc";
+    for (const p of mainParts) p.hidden = v === "doc";
+    if (v === "doc") ui.render();
+  };
+  chatLink.addEventListener("click", () => setView("chat"));
+  docLink.addEventListener("click", () => setView("doc"));
+
+  const author = (v) => {
+    const p = s.participants.get(v.author);
+    return { name: v.author === s.me ? "you" : p?.display_name || "someone who left", role: p?.role || "", av: initials(p?.display_name || "?") };
+  };
+  const avatar = (v) => {
+    const a = author(v);
+    return el("span", { class: `av ${["owner", "sender"].includes(a.role) ? a.role : ""}`, "aria-hidden": "true", title: `${a.name} · ${a.role}` }, a.av);
+  };
+  const stampBtn = (t, v) => el("button", { type: "button", class: "stamp mono", title: "This version's stamp. Click to copy: agents pass it as --base when they write.",
+    onclick: (ev) => copyText(ev.currentTarget, v.stamp, v.stamp) }, v.stamp);
+  const agentCmd = (t) => {
+    const name = tabName(t).toLowerCase();
+    return `airlox doc show --tab ${name}   # then: airlox doc edit --tab ${name} --base ${t.head.stamp} --file ${name}.md --note "…"`;
+  };
+
+  // ----- writes -----
+  const writeTab = async (doc, t, fields, note) => {
+    const cur = t?.content;
+    const meta = { type: "doc_tab", v: 1, name: fields.name ?? cur?.name ?? "Untitled", md: fields.md ?? cur?.md ?? "",
+      deleted: fields.deleted ?? cur?.deleted ?? false, note: note || "" };
+    const refs = t ? [doc.root, docRef(fields.base ?? t.head)] : [doc.root];
+    try {
+      const id = await docPost(s, "tab", refs, meta);
+      d.model = docModel(s);
+      if (!t) d.tab = id;
+      const now = docCurrent(s);
+      const tt = now?.tabs.find((x) => x.id === (t ? t.id : id));
+      if (tt) docSeen(s, tt.id, tt.head.id);
+      return { ok: true, stamp: tt?.head.stamp };
+    } catch (e) {
+      if (e.code === "stale_base") return { ok: false, stale: true };
+      throw e;
+    }
+  };
+  const busy = async (fn) => {
+    say("");
+    try {
+      return await fn();
+    } catch (e) {
+      say(`Could not save: ${explain(e)}`);
+      return null;
+    }
+  };
+
+  // ----- layout -----
+  const docbar = el("div", { class: "docbar" });
+  const tabs = el("div", { class: "doc-tabs", role: "tablist", "aria-label": "Doc tabs" });
+  const addTab = el("button", { type: "button", class: "addtab", hidden: !canWrite }, "+ Tab");
+  const page = el("div", { class: "doc-page", role: "tabpanel", tabindex: -1 });
+  const side = el("aside", { class: "doc-side", "aria-label": "Doc history and activity" });
+  pane.append(docbar, el("div", { class: "doc-tabrow" }, tabs, addTab), status, el("div", { class: "doc-body" }, page, side));
+
+  tabs.addEventListener("keydown", (ev) => {
+    const doc = docCurrent(s);
+    if (!doc) return;
+    const ids = doc.tabs.map((t) => t.id);
+    let k = ids.indexOf(docTab(s, doc)?.id);
+    if (ev.key === "ArrowRight") k = (k + 1) % ids.length;
+    else if (ev.key === "ArrowLeft") k = (k - 1 + ids.length) % ids.length;
+    else if (ev.key === "Home") k = 0;
+    else if (ev.key === "End") k = ids.length - 1;
+    else return;
+    ev.preventDefault();
+    ui.pick(ids[k]);
+    tabs.querySelector(`[data-tab="${ids[k]}"]`)?.focus();
+  });
+  addTab.addEventListener("click", () => {
+    const doc = docCurrent(s);
+    const name = prompt("Name of the new tab (every editor can edit and delete it):", "Notes");
+    if (!doc || !name?.trim()) return;
+    const id = `new:${Date.now()}`;
+    d.drafts.set(id, { md: "", base: null, note: "", name: name.trim() });
+    d.tab = id;
+    d.mode = "edit";
+    ui.render();
+  });
+
+  const ui = {
+    open: (versionId) => {
+      setView("doc");
+      if (!versionId) return;
+      const doc = docCurrent(s);
+      const t = doc?.tabs.find((x) => x.chain.versions.some((v) => v.id === versionId));
+      if (!t || d.mode === "edit") return;
+      d.tab = t.id;
+      const i = t.chain.versions.findIndex((v) => v.id === versionId);
+      d.mode = "history";
+      d.hist = { from: i - 1, to: i };
+      ui.render();
+    },
+    chat: () => setView("chat"),
+    badge: () => {
+      const doc = docCurrent(s);
+      const n = doc ? doc.tabs.filter((t) => docUnseen(s, t) > 0 && !(d.view === "doc" && t.id === docTab(s, doc)?.id)).length : 0;
+      docCount.textContent = n ? String(n) : "";
+      docLink.setAttribute("aria-label", n ? `Doc, ${n} tab${n === 1 ? "" : "s"} changed` : "Doc");
+    },
+    pick: (id) => {
+      if (id === d.tab) return;
+      d.merging = null;
+      d.tab = id;
+      const doc = docCurrent(s);
+      const t = doc?.tabs.find((x) => x.id === id);
+      d.mode = d.drafts.has(id) && !t ? "edit" : "read";
+      d.remote = null;
+      const seen = t && d.seen[t.id];
+      const at = t ? t.chain.versions.findIndex((v) => v.id === seen) : -1;
+      d.since = t && seen && at >= 0 && at < t.chain.versions.length - 1 ? { from: at, to: t.chain.versions.length - 1 } : null;
+      ui.render();
+    },
+    render: () => {
+      ui.badge();
+      const doc = docCurrent(s);
+      if (!doc) return ui.empty();
+      d.sel = doc.id;
+      // Docs tabs bar
+      const tt = docTab(s, doc);
+      const newDraft = String(d.tab || "").startsWith("new:") ? d.tab : null;
+      if (!newDraft) d.tab = tt?.id || null;
+      docbar.replaceChildren(...[
+        el("h2", { class: "doc-title" }, doc.title ?? "Untitled doc"),
+        el("span", { class: "doc-meta mono" }, `${doc.tabs.length} tab${doc.tabs.length === 1 ? "" : "s"} · doc ${doc.metaHead.stamp}`),
+        el("span", { class: "spacer" }),
+        (d.model || []).length > 1 ? el("select", { "aria-label": "Doc", onchange: (ev) => {
+          d.sel = ev.target.value;
+          d.tab = null;
+          d.mode = "read";
+          ui.render();
+        } }, d.model.map((x) => el("option", { value: x.id, selected: x.id === doc.id }, x.title ?? x.id.slice(0, 8)))) : null,
+        el("button", { type: "button", class: "ghost small", title: "Download every tab as one Markdown file", onclick: () => {
+          const md = `# ${doc.title ?? "Untitled"}\n\n` + doc.tabs.filter((t) => t.content && tabLive(t))
+            .map((t) => `<!-- airlox tab ${t.id} ${t.head.stamp} -->\n## ${t.content.name}\n\n${t.content.md.trimEnd()}\n`).join("\n");
+          const a = el("a", { href: URL.createObjectURL(new Blob([md], { type: "text/markdown" })), download: `${(doc.title || "doc").replace(/[^\w.-]+/g, "-").toLowerCase()}.md` });
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+        } }, "Export"),
+      ].filter(Boolean));
+      const shownTabs = doc.tabs.filter(tabLive);
+      tabs.replaceChildren(...shownTabs.map((t) => {
+        const sel = t.id === d.tab;
+        const unseen = !sel && docUnseen(s, t) > 0;
+        return el("button", { type: "button", role: "tab", class: "doc-tab", "data-tab": t.id, "aria-selected": String(sel), tabindex: sel ? 0 : -1,
+          onclick: () => ui.pick(t.id) }, tabName(t),
+          unseen ? [el("span", { class: "dot", "aria-hidden": "true" }), el("span", { class: "sr-only" }, ", changed since you looked")] : null,
+          d.drafts.has(t.id) ? el("span", { class: "draft" }, "draft") : null);
+      }), ...(newDraft ? [el("button", { type: "button", role: "tab", class: "doc-tab", "aria-selected": "true", tabindex: 0 },
+        d.drafts.get(newDraft).name, el("span", { class: "draft" }, "new"))] : []));
+      if (newDraft) return ui.edit(doc, null, newDraft);
+      if (!tt) return page.replaceChildren(el("p", { class: "muted" }, "Every tab of this doc is deleted. Restore one from the list on the right."));
+      if (d.mode === "edit") return ui.edit(doc, tt);
+      if (d.mode === "history") return ui.history(doc, tt);
+      ui.read(doc, tt);
+    },
+    empty: () => {
+      docbar.replaceChildren(el("h2", { class: "doc-title" }, "Shared doc"));
+      tabs.replaceChildren();
+      side.replaceChildren();
+      page.replaceChildren(el("div", { class: "doc-empty" },
+        el("p", {}, "No doc in this session yet. A doc holds a plan in tabs of Markdown that you and the agents here edit, one saved version at a time."),
+        canWrite ? el("button", { type: "button", class: "primary", onclick: async (ev) => {
+          const title = prompt("Title of the doc:", "Plan");
+          if (!title?.trim()) return;
+          ev.currentTarget.disabled = true;
+          await busy(async () => {
+            const root = await docPost(s, "root", [], { type: "doc_root", v: 1, title: title.trim(), order: [] });
+            const r = s.items.get(root)?.ref;
+            if (!r) throw new Error("the relay has not returned the new doc yet; try again");
+            await docPost(s, "tab", [r], { type: "doc_tab", v: 1, name: "Main", md: "", deleted: false, note: "Created the doc" });
+            d.model = docModel(s);
+            d.sel = root;
+            d.tab = null;
+            d.mode = "edit";
+            const doc = docCurrent(s);
+            const t = doc && docTab(s, doc);
+            if (t) d.drafts.set(t.id, { md: "", base: t.head.id, note: "" });
+            ui.render();
+          });
+        } }, "Create a doc") : el("p", { class: "muted" }, "Owners and senders can create one; it appears here.")));
+    },
+    read: (doc, t) => {
+      const v = d.remote?.shown && t.chain.versions.some((x) => x.id === d.remote.shown.id) ? d.remote.shown : t.head;
+      const content = docContent(s, v);
+      const a = author(v);
+      const menu = canWrite ? el("details", { class: "tabmenu" }, el("summary", { class: "ghost small", "aria-label": "More actions for this tab" }, "⋯"),
+        el("div", { class: "menu" },
+          el("button", { type: "button", onclick: (ev) => copyText(ev.currentTarget, agentCmd(t), "Copy edit command for an agent") }, "Copy edit command for an agent"),
+          el("button", { type: "button", onclick: () => busy(async () => {
+            const n = prompt("Rename tab:", tabName(t));
+            if (!n?.trim() || n.trim() === tabName(t)) return;
+            const r = await writeTab(doc, t, { name: n.trim() }, `Renamed ${tabName(t)} → ${n.trim()}`);
+            if (r.stale) say("Someone saved this tab a moment ago. Look at their change, then rename again.");
+            ui.render();
+          }) }, "Rename tab"),
+          el("button", { type: "button", onclick: () => ui.move(doc, t, -1) }, "Move left"),
+          el("button", { type: "button", onclick: () => ui.move(doc, t, 1) }, "Move right"),
+          el("button", { type: "button", class: "danger", onclick: () => busy(async () => {
+            if (doc.tabs.filter(tabLive).length === 1) return say("A doc keeps at least one tab.");
+            if (!confirm(`Delete “${tabName(t)}” for everyone? Its last version is kept, and anyone who can edit can restore it.`)) return;
+            const r = await writeTab(doc, t, { deleted: true }, "Deleted tab");
+            if (r.stale) say("Someone saved this tab a moment ago. Look at their change, then delete again.");
+            d.tab = null;
+            ui.render();
+          }) }, "Delete tab"))) : null;
+      const head = el("div", { class: "tabhead" },
+        el("div", { class: "by" }, avatar(v), el("span", {}, el("strong", {}, a.name), ` · ${docAgo(v.created_at_ms)}`), stampBtn(t, v),
+          el("span", { class: "ver", title: `Signed by ${a.name}; checked in this browser` }, "✓ signed")),
+        el("span", { class: "spacer" }),
+        el("button", { type: "button", class: "ghost small", onclick: () => {
+          const i = t.chain.versions.length - 1;
+          d.mode = "history";
+          d.hist = { from: i - 1, to: i };
+          ui.render();
+        } }, "Changes"),
+        canWrite ? el("button", { type: "button", class: "primary small", onclick: () => ui.startEdit(t) }, d.drafts.has(t.id) ? "Resume draft" : "Edit") : null,
+        menu);
+      const notes = [];
+      if (d.remote?.shown && v.id !== t.head.id) {
+        notes.push(el("div", { class: "doc-banner info", role: "status" }, el("span", {}, el("strong", {}, author(t.head).name), ` saved ${t.head.stamp}${t.content?.note ? ` · “${t.content.note}”` : ""}`),
+          el("button", { type: "button", class: "small", onclick: () => {
+            d.remote = null;
+            ui.render();
+          } }, "Show it")));
+      } else if (d.since) {
+        const n = d.since.to - d.since.from;
+        const who = [...new Set(t.chain.versions.slice(d.since.from + 1, d.since.to + 1).map((x) => author(x).name))].join(", ");
+        notes.push(el("div", { class: "doc-banner info" }, el("span", {}, `${n} new version${n === 1 ? "" : "s"} since you last looked, by ${who}`),
+          el("button", { type: "button", class: "small", onclick: () => {
+            d.mode = "history";
+            d.hist = { ...d.since };
+            d.since = null;
+            ui.render();
+          } }, "See what changed")));
+      }
+      if (content?.deleted) notes.push(el("div", { class: "doc-banner warn" }, "This tab is deleted."));
+      const body = content
+        ? docMarkdown(s, content.md, canWrite && v.id === t.head.id ? (md, note, cb) => busy(async () => {
+          cb.disabled = true;
+          const before = t.content.md;
+          const r = await writeTab(doc, t, { md }, note);
+          if (r?.stale) say("Someone saved this tab a moment ago, so the tick was not saved. Their version is shown now.");
+          else if (r?.ok) toastUndo(`${note} · ${r.stamp}`, () => busy(async () => {
+            const now = docCurrent(s)?.tabs.find((x) => x.id === t.id);
+            if (now) await writeTab(doc, now, { md: before }, `Undo: ${note}`);
+            ui.render();
+          }));
+          ui.render();
+        }) : null)
+        : el("p", { class: "muted" }, "This version's content is not in this browser: it left the relay before this browser got it. Who saved it and when is in the history.");
+      page.replaceChildren(head, ...notes, body, el("p", { class: "doc-untrusted muted" }, DOC_UNTRUSTED));
+      if (content && v.id === t.head.id && !d.remote) {
+        docSeen(s, t.id, t.head.id);
+        ui.badge();
+      }
+      ui.side(doc, t);
+    },
+    move: (doc, t, step) => busy(async () => {
+      const ids = doc.tabs.map((x) => x.id);
+      const i = ids.indexOf(t.id);
+      const j = i + step;
+      if (j < 0 || j >= ids.length) return;
+      [ids[i], ids[j]] = [ids[j], ids[i]];
+      try {
+        await docPost(s, "meta", [doc.root, docRef(doc.metaHead)], { type: "doc_meta", v: 1, title: doc.title ?? "Untitled doc", order: ids });
+      } catch (e) {
+        if (e.code === "stale_base") return say("Someone changed the tab order a moment ago. Try again.");
+        throw e;
+      }
+      d.model = docModel(s);
+      ui.render();
+    }),
+    startEdit: (t) => {
+      if (!d.drafts.has(t.id)) d.drafts.set(t.id, { md: t.content?.md ?? "", base: t.head.id, note: "" });
+      d.mode = "edit";
+      d.merging = null;
+      d.remote = null;
+      ui.render();
+      page.querySelector("textarea")?.focus();
+    },
+    edit: (doc, t, newId = null) => {
+      const key = newId || t.id;
+      const dr = d.drafts.get(key);
+      const base = t?.chain.versions.find((x) => x.id === dr.base);
+      const ta = el("textarea", { spellcheck: "false", "aria-label": `${t ? tabName(t) : dr.name} Markdown` }, dr.md);
+      const pv = el("div", { class: "pv", "aria-label": "Preview" });
+      const banner = el("div", {});
+      const merge = el("div", {});
+      const size = el("span", { class: "size mono" });
+      const noteIn = el("input", { id: "doc-note", value: dr.note, placeholder: "What changed? Shown in history and to agents" });
+      const save = el("button", { type: "button", class: "primary" });
+      const editor = el("div", { class: `editor${d.single ? " single" : ""}${d.previewing ? " previewing" : ""}` }, ta, pv);
+      const preview = () => pv.replaceChildren(docMarkdown(s, dr.md, null));
+      ta.addEventListener("input", () => {
+        dr.md = ta.value;
+        preview();
+        refresh();
+      });
+      ta.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) {
+          ev.preventDefault();
+          save.click();
+        }
+      });
+      noteIn.addEventListener("input", () => (dr.note = noteIn.value));
+      // Only the banner and the save bar change when a new version arrives,
+      // so the cursor and undo history survive.
+      const refresh = () => {
+        const now = docCurrent(s)?.tabs.find((x) => x.id === t?.id);
+        const stale = !!now && now.head.id !== dr.base;
+        const bytes = new TextEncoder().encode(dr.md).length;
+        size.textContent = `${(bytes / 1024).toFixed(1)} of 256 KiB`;
+        size.classList.toggle("over", bytes > DOC_MAX_MD);
+        save.textContent = t ? `Save as v${(now || t).chain.versions.length + 1}` : "Create tab";
+        save.disabled = stale || bytes > DOC_MAX_MD || !!s.closed;
+        if (stale) {
+          const newer = now.chain.versions.slice(now.chain.versions.findIndex((x) => x.id === dr.base) + 1);
+          banner.replaceChildren(el("div", { class: "doc-banner warn", role: "alert" },
+            el("div", {}, el("strong", {}, `${[...new Set(newer.map((x) => author(x).name))].join(", ")} saved ${now.head.stamp} after your draft started`),
+              el("p", {}, `Your draft is based on ${base?.stamp ?? "an older version"}. Save is off until you merge, so their change can't be lost.`),
+              el("div", { class: "row" },
+                el("button", { type: "button", class: "primary small", onclick: () => {
+                  d.merging = { mine: dr.md, from: dr.base };
+                  dr.md = now.content?.md ?? "";
+                  dr.base = now.head.id;
+                  ui.render();
+                  page.querySelector("textarea")?.focus();
+                } }, `Merge into ${now.head.stamp}`),
+                el("button", { type: "button", class: "small", onclick: () => {
+                  d.theirs = !d.theirs;
+                  refresh();
+                } }, "See their change"),
+                el("button", { type: "button", class: "ghost small", onclick: () => {
+                  if (!confirm("Discard your draft? The tab stays as they saved it.")) return;
+                  d.drafts.delete(key);
+                  d.mode = "read";
+                  ui.render();
+                } }, "Discard my draft")))));
+        } else banner.replaceChildren();
+        const mergeFrom = d.merging && t?.chain.versions.find((x) => x.id === d.merging.from);
+        merge.replaceChildren(...(d.merging && mergeFrom ? [
+          el("p", { class: "caption" }, "The editor now holds ", el("strong", {}, now?.head.stamp ?? ""), ". Your edits, to copy across:"),
+          docDiff(docContent(s, mergeFrom)?.md ?? "", d.merging.mine),
+          el("details", {}, el("summary", { class: "caption" }, "Your whole draft"), el("pre", { class: "mine" }, d.merging.mine))]
+          : d.theirs && stale && base ? [el("p", { class: "caption" }, `Their change, ${base.stamp} → ${now.head.stamp}`), docDiff(docContent(s, base)?.md ?? "", now.content?.md ?? "")] : []));
+      };
+      save.addEventListener("click", () => busy(async () => {
+        save.disabled = true;
+        const now = docCurrent(s)?.tabs.find((x) => x.id === t?.id);
+        const note = dr.note.trim() || (t ? (d.merging ? `Merged my edits into ${now?.head.stamp}` : "Edit") : "Created tab");
+        const r = t ? await writeTab(doc, now || t, { md: dr.md, base: (now || t).chain.versions.find((x) => x.id === dr.base) }, note)
+          : await writeTab(doc, null, { name: dr.name, md: dr.md }, note);
+        if (r?.stale) {
+          d.model = docModel(s);
+          return refresh();
+        }
+        if (!r?.ok) return refresh();
+        d.drafts.delete(key);
+        d.merging = null;
+        d.mode = "read";
+        announce(`Saved ${t ? tabName(t) : dr.name} ${r.stamp ?? ""}`);
+        ui.render();
+      }));
+      const cancel = el("button", { type: "button", class: "ghost" }, "Cancel");
+      cancel.addEventListener("click", () => {
+        const dirty = d.merging || dr.md !== (docContent(s, base || {})?.md ?? "");
+        if (dirty && !confirm("Discard your draft? Your unsaved changes to this tab will be lost.")) return;
+        d.drafts.delete(key);
+        d.merging = null;
+        d.mode = "read";
+        if (newId) d.tab = null;
+        ui.render();
+      });
+      const layout = (mode) => el("button", { type: "button", "aria-pressed": String(mode === "single" ? !!d.single : mode === "split" ? !d.single : !!d.previewing),
+        class: mode === "preview" ? "narrow-only" : "", onclick: () => {
+          if (mode === "preview") d.previewing = !d.previewing;
+          else d.single = mode === "single";
+          ui.render();
+        } }, mode === "split" ? "Split" : mode === "single" ? "Markdown only" : "Preview");
+      page.replaceChildren(
+        el("div", { class: "tabhead" }, el("div", { class: "by" }, el("span", {}, t ? ["Editing ", el("strong", {}, tabName(t)), " · based on "] : ["New tab ", el("strong", {}, dr.name)]),
+          base ? el("span", { class: "stamp mono" }, base.stamp) : null)),
+        banner,
+        el("div", { class: "edbar" }, el("div", { class: "seg", role: "group", "aria-label": "Editor layout" }, layout("split"), layout("single"), layout("preview")),
+          el("span", { class: "hint mono" }, "Markdown · the whole tab is saved as one version · ⌘/Ctrl+Enter saves")),
+        merge, editor,
+        el("div", { class: "savebar" }, el("label", { for: "doc-note" }, "Note"), noteIn, size, cancel, save));
+      preview();
+      refresh();
+      ui.refreshEdit = refresh;
+      ui.side(doc, t);
+    },
+    refreshEdit: () => {},
+    history: (doc, t) => {
+      const vs = t.chain.versions;
+      const to = vs[d.hist.to];
+      const from = d.hist.from >= 0 ? vs[d.hist.from] : null;
+      const toC = docContent(s, to);
+      const fromC = from ? docContent(s, from) : null;
+      const single = d.hist.from === d.hist.to - 1;
+      const cur = t.head;
+      const head = el("div", { class: "tabhead" },
+        el("div", { class: "by" }, avatar(to), single
+          ? el("span", {}, el("strong", {}, to.stamp), ` by ${author(to).name} · ${docAgo(to.created_at_ms)}`)
+          : el("span", {}, "Changes from ", el("strong", {}, from?.stamp ?? "the start"), " to ", el("strong", {}, to.stamp))),
+        el("span", { class: "spacer" }),
+        el("button", { type: "button", class: "ghost small", onclick: () => {
+          d.mode = "read";
+          ui.render();
+        } }, "Back to current"),
+        canWrite && toC && to.id !== cur.id ? el("button", { type: "button", class: "small", onclick: () => busy(async () => {
+          if (!confirm(`Restore ${to.stamp} as v${vs.length + 1}? This replaces the current text (${cur.stamp} by ${author(cur).name}) for everyone. The current text stays in history.`)) return;
+          const r = await writeTab(doc, t, { md: toC.md, name: toC.name, deleted: false }, `Restored ${to.stamp}`);
+          if (r?.stale) return say("Someone saved this tab a moment ago. Look again before restoring.");
+          d.mode = "read";
+          ui.render();
+        }) }, "Restore this version…") : null);
+      const parts = [];
+      if (single && toC?.note) parts.push(el("p", { class: "caption" }, `“${toC.note}”`));
+      if (!toC) {
+        parts.push(el("div", { class: "doc-banner info" }, el("div", {}, el("strong", {}, "Content no longer available"),
+          el("p", {}, "The relay keeps the last few versions of each tab and the owner's latest. This one is older, and this browser never got it. Who saved it and when stays in the history."))));
+      } else {
+        if (from && !fromC) parts.push(el("p", { class: "caption" }, `${from.stamp} is not available here, so this shows the whole version.`));
+        if (fromC && fromC.name !== toC.name) parts.push(el("p", { class: "caption" }, `Renamed “${fromC.name}” to “${toC.name}”.`));
+        parts.push(docDiff(fromC?.md ?? "", toC.md), el("p", { class: "caption doc-rendered" }, el("strong", {}, to.stamp), " as rendered"), docMarkdown(s, toC.md, null));
+      }
+      page.replaceChildren(head, ...parts);
+      ui.side(doc, t);
+    },
+    side: (doc, t) => {
+      const sections = [];
+      if (t) {
+        const hist = t.chain.versions.map((v, i) => [v, i]).reverse();
+        sections.push(el("section", {}, el("h2", {}, `Tab history · ${hist.length}`), el("ul", { class: "hist" }, hist.map(([v, i]) => {
+          const c = docContent(s, v);
+          const cur = d.mode === "history" && d.hist?.to === i;
+          return el("li", {}, el("button", { type: "button", "aria-current": String(cur), onclick: () => {
+            if (d.mode === "edit") return say("Save or cancel your edit first; your draft stays with this tab.");
+            d.mode = "history";
+            d.hist = { from: i - 1, to: i };
+            ui.render();
+          } }, avatar(v), el("span", { class: "hn" }, c ? c.note || (i === 0 ? "Created" : "Saved") : "content no longer available",
+            el("span", { class: "hv" }, author(v).name)), el("span", { class: "hv mono" }, v.stamp, el("br"), docAgo(v.created_at_ms))));
+        }))));
+      }
+      const deleted = doc.tabs.filter((x) => !tabLive(x));
+      if (deleted.length) {
+        sections.push(el("section", {}, el("h2", {}, "Deleted tabs"), el("ul", { class: "hist" }, deleted.map((x) => el("li", { class: "deleted-row" },
+          el("span", {}, el("strong", {}, tabName(x)), el("span", { class: "hv" }, ` deleted by ${author(x.head).name} · ${x.head.stamp}`)),
+          canWrite ? el("button", { type: "button", class: "small", onclick: () => busy(async () => {
+            const r = await writeTab(doc, x, { deleted: false }, `Restored tab (deleted by ${author(x.head).name})`);
+            if (r?.stale) return say("Someone changed this tab a moment ago. Try again.");
+            d.tab = x.id;
+            d.mode = "read";
+            ui.render();
+          }) }, "Restore") : null)))));
+      }
+      const all = doc.tabs.flatMap((x) => x.chain.versions.map((v) => [v, x])).sort((a, b) => b[0].seq - a[0].seq);
+      const shown = d.feedAll ? all : all.slice(0, 6);
+      sections.push(el("section", {}, el("h2", {}, "Activity", all.length > 6 ? el("button", { type: "button", class: "linkish", onclick: () => {
+        d.feedAll = !d.feedAll;
+        ui.side(doc, t);
+      } }, d.feedAll ? "Fewer" : `All ${all.length}`) : null),
+      el("ul", { class: "feed" }, shown.map(([v, x]) => {
+        const c = docContent(s, v);
+        return el("li", {}, avatar(v), el("div", {}, el("div", {}, el("strong", {}, author(v).name), " saved ", el("span", { class: "tn" }, tabName(x))),
+          c?.note ? el("div", { class: "fn" }, `“${c.note}”`) : null,
+          el("div", { class: "fm mono" }, `${author(v).role} · ${docAgo(v.created_at_ms)} · `, el("button", { type: "button", class: "linkish", onclick: () => {
+            if (d.mode === "edit") return say("Save or cancel your edit first; your draft stays with this tab.");
+            d.tab = x.id;
+            d.mode = "history";
+            const i = x.chain.versions.findIndex((y) => y.id === v.id);
+            d.hist = { from: i - 1, to: i };
+            ui.render();
+          } }, v.stamp))));
+      }))));
+      const saves = [...s.items.values()].filter((it) => it.kind === "doc").length;
+      sections.push(el("section", {}, el("h2", {}, "Keeping this doc"),
+        el("p", { class: "muted" }, `${saves} doc saves in this session. The doc lives in the session: when the session ends or the relay purges it after days without activity, the doc goes with it. Export keeps a copy.`)));
+      side.replaceChildren(...sections);
+    },
+  };
+  s.docUi = ui;
+  railSet?.();
+  return pane;
+}
+
+// A toast with an Undo button, for one-click writes such as ticking a task.
+function toastUndo(text, undo) {
+  document.getElementById("doc-toast")?.remove();
+  const t = el("div", { class: "doc-toast", id: "doc-toast", role: "status" }, el("span", {}, text),
+    el("button", { type: "button", class: "linkish", onclick: () => {
+      t.remove();
+      undo();
+    } }, "Undo"));
+  document.body.append(t);
+  setTimeout(() => t.remove(), 6000);
+}
+
 // ---------- runner console ----------
 // Runner details come only from a verified signed join, never from the
 // relay's unsigned fields.
@@ -3509,7 +4267,7 @@ function buildJobPanel(s, text, file, onKind) {
 // ---------- sending ----------
 async function sendPayload(s, kind, subkind, meta, body, { path = "items", headers = {}, refs = [] } = {}) {
   // `sh` marks a shell job, not a content type: only the manifest's kinds govern it.
-  const needed = kind === "text" ? "text" : kind === "event" || kind === "result" || subkind === "sh" ? null : subkind;
+  const needed = kind === "text" ? "text" : kind === "doc" ? "doc" : kind === "event" || kind === "result" || subkind === "sh" ? null : subkind;
   if (needed && !s.manifest.allowed_types.includes(needed)) throw new Error(`${needed} is not allowed in this session`);
   const payload = ac.encodePayload(JSON.stringify(meta), body);
   if (payload.length > s.manifest.max_item_bytes) throw new Error(`too large: the limit is ${fmtBytes(s.manifest.max_item_bytes)}`);
