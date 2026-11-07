@@ -33,6 +33,10 @@ use crate::{Error, Result};
 pub const DOC_V: u32 = 1;
 pub const MAX_TABS: usize = 64;
 pub const MAX_MD_BYTES: usize = 256 * 1024;
+/// The largest doc item the relay accepts: a tab's text at its limit, with
+/// room for JSON escaping and the rest of the payload. The relay cannot read
+/// the text, so this is what stops one writer filling the doc storage.
+pub const MAX_DOC_ITEM_BYTES: u64 = 1024 * 1024;
 pub const MAX_TITLE_CHARS: usize = 200;
 pub const MAX_TAB_NAME_CHARS: usize = 64;
 pub const MAX_NOTE_CHARS: usize = 512;
@@ -91,13 +95,25 @@ pub fn check_tab(t: &DocTab) -> Result<()> {
     if t.md.len() > MAX_MD_BYTES {
         return Err(Error::invalid("doc", format!("tab text exceeds {} KiB", MAX_MD_BYTES / 1024)));
     }
-    if t.md.contains('\0') {
-        return Err(Error::invalid("doc", "tab text contains NUL"));
+    if let Some(c) = t.md.chars().find(|&c| hidden_in_text(c)) {
+        return Err(Error::invalid(
+            "doc",
+            format!("tab text contains U+{:04X}, a control or hidden character", c as u32),
+        ));
     }
     if !t.note.is_empty() {
         crate::cert::check_display_text("note", &t.note, MAX_NOTE_CHARS)?;
     }
     crate::policy::check_recipients(t.to.as_deref())
+}
+
+/// Characters a tab's text may not hold: controls other than tab and line
+/// breaks (terminal escapes), bidirectional overrides and isolates (text that
+/// reads differently than it is stored) and tag characters (text a person
+/// cannot see but a model reads).
+fn hidden_in_text(c: char) -> bool {
+    (c.is_control() && !matches!(c, '\n' | '\t' | '\r'))
+        || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{E0000}'..='\u{E007F}')
 }
 
 /// `v<n>·<first 8 hex digits of the blob's SHA-256>`: a version's short name
@@ -517,6 +533,22 @@ mod tests {
     use crate::payload::Payload;
 
     const SID: &str = "ax_aaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn tab_text_refuses_hidden_and_control_characters() {
+        let t = |md: &str| DocTab {
+            v: DOC_V,
+            name: "Main".into(),
+            md: md.into(),
+            deleted: false,
+            note: String::new(),
+            to: None,
+        };
+        assert!(check_tab(&t("plain\r\n\tindented — and ünïcode, 日本語 ✓\n")).is_ok());
+        for bad in ["\u{1b}[2J", "a\0b", "\u{7}", "\u{202E}evil", "x\u{2066}y", "hide\u{E0041}"] {
+            assert!(check_tab(&t(bad)).is_err(), "{bad:?}");
+        }
+    }
 
     fn item(a: &Keypair, sub: ContentType, refs: Vec<ItemRef>, meta: Meta) -> SealedItem {
         let new = NewItem {

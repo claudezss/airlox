@@ -424,7 +424,7 @@ pub struct DocCreateParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct DocReadParams {
-    /// Doc id (or prefix) or title; default: the only, or latest changed, doc.
+    /// Doc title or id (or a prefix); default: the only doc, or the only one the owner created.
     pub doc: Option<String>,
     /// Tab name or id; default: the first tab.
     pub tab: Option<String>,

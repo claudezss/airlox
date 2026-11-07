@@ -180,3 +180,67 @@ async fn export_continues_in_a_new_session_and_limits_warn() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retitle_keeps_order_and_the_default_doc_is_the_owners() {
+    let env = Env::new().await;
+    let s = new_session_with(Mode::Relay, Some(3_600_000), |p| p.allowed_types.push(ContentType::Doc));
+    create(&env, &s).await;
+    let o = Invite::owner(&env.base, &s.secrets).unwrap().to_url();
+    let sender = Invite::member(&env.base, &s.secrets, Role::Sender).unwrap().to_url();
+    let dir = tempfile::tempdir().unwrap();
+    let (c, cs) = (dir.path().join("o"), dir.path().join("s"));
+    tokio::task::spawn_blocking(move || {
+        assert!(airlox(&o, &c, "owner", &["doc", "new", "Plan", "--json"], None).status.success());
+        assert!(airlox(&o, &c, "owner", &["doc", "tab", "add", "Progress", "--json"], None).status.success());
+        // A sender's doc does not become the default.
+        assert!(airlox(&sender, &cs, "a", &["doc", "new", "Other", "--json"], None).status.success());
+        let show = json_of(&airlox(&o, &c, "owner", &["doc", "show", "--json"], None));
+        assert_eq!(show["doc"]["title"], "Plan");
+        let out = airlox(&sender, &cs, "a", &["doc", "show", "--doc", "other", "--json"], None);
+        assert_eq!(json_of(&out)["doc"]["title"], "Other");
+
+        // Reorder, then retitle without --order: the order stays.
+        let doc_stamp = show["doc"]["stamp"].as_str().unwrap().to_string();
+        let m = airlox(
+            &o,
+            &c,
+            "owner",
+            &[
+                "doc", "meta", "--doc", "plan", "--base", &doc_stamp, "--order", "progress", "--order",
+                "main", "--json",
+            ],
+            None,
+        );
+        assert!(m.status.success(), "{}", String::from_utf8_lossy(&m.stderr));
+        let stamp = json_of(&m)["stamp"].as_str().unwrap().to_string();
+        let m = airlox(
+            &o,
+            &c,
+            "owner",
+            &["doc", "meta", "--doc", "plan", "--base", &stamp, "--title", "Plan v2", "--json"],
+            None,
+        );
+        assert!(m.status.success(), "{}", String::from_utf8_lossy(&m.stderr));
+        let ls = json_of(&airlox(&o, &c, "owner", &["doc", "ls", "--json"], None));
+        let plan = ls["docs"].as_array().unwrap().iter().find(|d| d["title"] == "Plan v2").unwrap();
+        let names: Vec<&str> =
+            plan["tabs"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["Progress", "Main"]);
+
+        // A second doc: the owner's stays the default; a second owner doc
+        // makes the default ambiguous, and the docs are listed instead.
+        let out = airlox(&o, &c, "owner", &["doc", "show", "--json"], None);
+        assert_eq!(json_of(&out)["doc"]["title"], "Plan v2");
+        let new = airlox(&o, &c, "owner", &["doc", "new", "Notes", "--json"], None);
+        assert!(new.status.success());
+        let out = airlox(&o, &c, "owner", &["doc", "show"], None);
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("several docs") && err.contains("Notes") && err.contains("Plan v2"), "{err}");
+        let out = airlox(&o, &c, "owner", &["doc", "show", "--doc", "notes", "--json"], None);
+        assert_eq!(json_of(&out)["doc"]["title"], "Notes");
+    })
+    .await
+    .unwrap();
+}

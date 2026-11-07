@@ -85,7 +85,15 @@ pub fn check_header(m: &Manifest, author_role: Role, h: &ItemHeader) -> Result<(
         }
         ItemKind::Result | ItemKind::Progress => require_execute(m)?,
         ItemKind::Event => {}
-        ItemKind::Doc => require_type(m, ContentType::Doc)?,
+        ItemKind::Doc => {
+            require_type(m, ContentType::Doc)?;
+            if h.size > crate::doc::MAX_DOC_ITEM_BYTES {
+                return Err(Error::policy(format!(
+                    "doc items are at most {} KiB",
+                    crate::doc::MAX_DOC_ITEM_BYTES / 1024
+                )));
+            }
+        }
     }
     Ok(())
 }

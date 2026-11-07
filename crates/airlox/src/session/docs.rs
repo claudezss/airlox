@@ -118,60 +118,79 @@ impl Session {
         resolve(doc, |r| self.doc_content(r))
     }
 
-    /// A doc by id (or a prefix of at least 4 characters) or title (any
-    /// case). Without one: the only doc, or the most recently changed.
+    /// A doc by title (any case) or id (or a prefix of at least 4
+    /// characters). A spec that matches more than one doc, by title or id,
+    /// is refused: ids are chosen by their authors, so a writer could make
+    /// one start with another doc's title. Without a spec: the only doc, or
+    /// else the only doc the owner created; otherwise the docs are listed.
     pub fn doc_find(&self, spec: Option<&str>) -> Result<(Doc, DocState)> {
         let ix = self.doc_index();
         let docs: Vec<&Doc> = ix.docs().collect();
         if docs.is_empty() {
             bail!("this session has no docs yet; create one with `airlox doc new \"Title\"`");
         }
+        let list = || {
+            docs.iter()
+                .map(|d| {
+                    let t = self.doc_state(d).title.unwrap_or_else(|| "(untitled)".into());
+                    format!("  {}  {}", d.id(), crate::files::clean_line(&t))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let doc = match spec {
-            None => *docs
-                .iter()
-                .max_by_key(|d| d.chains().map(|c| c.head().seq).max().unwrap_or(0))
-                .expect("not empty"),
+            None if docs.len() == 1 => docs[0],
+            None => {
+                let by_owner: Vec<&&Doc> = docs.iter().filter(|d| d.meta.versions[0].owner).collect();
+                match by_owner.as_slice() {
+                    [d] => **d,
+                    _ => bail!("this session has several docs; pass --doc with one of:\n{}", list()),
+                }
+            }
             Some(s) => {
-                let by_title: Vec<&&Doc> = docs
+                let mut hits: Vec<&Doc> = docs
                     .iter()
+                    .copied()
                     .filter(|d| self.doc_state(d).title.is_some_and(|t| t.eq_ignore_ascii_case(s)))
                     .collect();
-                let by_id: Vec<&&Doc> =
-                    docs.iter().filter(|d| s.len() >= 4 && d.id().starts_with(s)).collect();
-                match (by_id.as_slice(), by_title.as_slice()) {
-                    ([d], _) | ([], [d]) => **d,
-                    ([], []) => bail!("no doc {s:?} in this session (airlox doc ls lists them)"),
-                    _ => bail!("{s:?} matches several docs; use its id"),
+                for d in docs.iter().filter(|d| d.id() == s || (s.len() >= 4 && d.id().starts_with(s))) {
+                    if !hits.iter().any(|h| h.id() == d.id()) {
+                        hits.push(d);
+                    }
+                }
+                match hits.as_slice() {
+                    [d] => *d,
+                    [] => bail!("no doc {s:?} in this session (airlox doc ls lists them)"),
+                    _ => bail!("{s:?} matches several docs; use the full id of one of:\n{}", list()),
                 }
             }
         };
         Ok((doc.clone(), self.doc_state(doc)))
     }
 
-    /// A tab by id (or a prefix of at least 4 characters) or name (any
-    /// case); without one, the first tab that is not deleted.
+    /// A tab by name (any case) or id (or a prefix of at least 4
+    /// characters); without one, the first tab that is not deleted. When a
+    /// spec matches several tabs, live ones are preferred; if that still
+    /// leaves more than one, it is refused.
     pub fn tab_find<'a>(st: &'a DocState, spec: Option<&str>) -> Result<&'a TabState> {
         let live = |t: &&TabState| t.content.as_ref().is_none_or(|c| !c.deleted);
         let Some(s) = spec else {
             return st.tabs.iter().find(live).context("this doc has no tabs");
         };
-        let by_name: Vec<&TabState> = st
+        let hits: Vec<&TabState> = st
             .tabs
             .iter()
-            .filter(|t| t.content.as_ref().is_some_and(|c| c.name.eq_ignore_ascii_case(s)))
+            .filter(|t| {
+                t.content.as_ref().is_some_and(|c| c.name.eq_ignore_ascii_case(s))
+                    || t.id == s
+                    || (s.len() >= 4 && t.id.starts_with(s))
+            })
             .collect();
-        let by_id: Vec<&TabState> = st.tabs.iter().filter(|t| s.len() >= 4 && t.id.starts_with(s)).collect();
-        match (by_id.as_slice(), by_name.as_slice()) {
-            ([t], _) | ([], [t]) => Ok(t),
-            ([], []) => bail!("no tab {s:?} in this doc"),
-            (_, names) => {
-                // Prefer a live tab when a deleted one has the same name.
-                let mut live_names = names.iter().filter(|t| live(t));
-                match (live_names.next(), live_names.next()) {
-                    (Some(t), None) => Ok(t),
-                    _ => bail!("{s:?} matches several tabs; use its id"),
-                }
-            }
+        let live_hits: Vec<&TabState> = hits.iter().copied().filter(live).collect();
+        match (hits.as_slice(), live_hits.as_slice()) {
+            ([t], _) | (_, [t]) => Ok(t),
+            ([], _) => bail!("no tab {s:?} in this doc"),
+            _ => bail!("{s:?} matches several tabs; use the tab's full id (airlox doc ls lists them)"),
         }
     }
 
@@ -252,8 +271,8 @@ impl Session {
             airlox_core::doc::check_tab(&t)?;
         }
         let root = self.post_doc("root", vec![], Meta::DocRoot(info)).await?;
-        for (name, md) in &tabs {
-            self.doc_write(DocWrite {
+        for (i, (name, md)) in tabs.iter().enumerate() {
+            let w = DocWrite {
                 doc: root.clone(),
                 tab: None,
                 base: None,
@@ -262,8 +281,35 @@ impl Session {
                 deleted: false,
                 note: note.to_string(),
                 to: vec![],
-            })
-            .await?;
+            };
+            // The relay allows a writer a limited number of doc saves a
+            // minute; a large import waits for the window instead of
+            // stopping half way.
+            let mut waited = 0;
+            loop {
+                match self.doc_write(w.clone()).await {
+                    Ok(_) => break,
+                    Err(e)
+                        if waited < 90 && e.downcast_ref::<RelayError>().is_some_and(|r| r.status == 429) =>
+                    {
+                        if waited == 0 {
+                            eprintln!(
+                                "waiting for the relay's doc save limit ({} of {} tabs done)…",
+                                i,
+                                tabs.len()
+                            );
+                        }
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        waited += 5;
+                    }
+                    Err(e) => {
+                        return Err(e.context(format!(
+                            "imported {i} of {} tabs into doc {root}; the rest were not posted",
+                            tabs.len()
+                        )))
+                    }
+                }
+            }
         }
         Ok(root)
     }
@@ -319,7 +365,10 @@ impl Session {
             .get(&w.doc)
             .and_then(|d| d.tabs.iter().find(|c| c.versions.iter().any(|v| v.item.id == posted)))
             .context("the relay stored the version but it is not in the doc; was the doc rewritten?")?;
-        let stamp = chain.head_stamp();
+        // The stamp of the version just posted: another save may already be
+        // on top of it, and that one is not ours to report.
+        let at = chain.versions.iter().position(|v| v.item.id == posted).expect("found by this id");
+        let stamp = chain.stamp_at(at);
         let _ = self.mark_doc_read(&chain.id, &posted);
         Ok((chain.id.clone(), stamp))
     }
@@ -341,8 +390,8 @@ impl Session {
             return Err(self.stale(&d.meta, base, false).into());
         }
         let refs = vec![d.root().clone(), base.clone()];
-        match self.post_doc("meta", refs, Meta::DocMeta(info)).await {
-            Ok(_) => {}
+        let posted = match self.post_doc("meta", refs, Meta::DocMeta(info)).await {
+            Ok(id) => id,
             Err(e) if e.downcast_ref::<RelayError>().is_some_and(|r| r.code == "stale_base") => {
                 self.sync().await?;
                 let ix = self.doc_index();
@@ -350,9 +399,15 @@ impl Session {
                 return Err(self.stale(&d.meta, base, true).into());
             }
             Err(e) => return Err(e),
-        }
+        };
         let ix = self.doc_index();
-        Ok(ix.get(doc).context("no such doc")?.meta.head_stamp())
+        let meta = &ix.get(doc).context("no such doc")?.meta;
+        let at = meta
+            .versions
+            .iter()
+            .position(|v| v.item.id == posted)
+            .context("the posted version is not in the doc")?;
+        Ok(meta.stamp_at(at))
     }
 
     fn stale(&self, chain: &Chain, base: &ItemRef, lost_race: bool) -> StaleBase {

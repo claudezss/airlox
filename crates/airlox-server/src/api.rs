@@ -376,7 +376,9 @@ pub async fn usage(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     let s = session(&st, &id)?;
-    auth(&s, &headers)?;
+    if auth(&s, &headers)?.1 == Role::Runner {
+        return Err(ApiError::forbidden("runners do not see the session's usage"));
+    }
     let cfg = &st.store.cfg;
     let g = s.lock();
     Ok(Json(json!({
@@ -747,7 +749,10 @@ async fn receive_blob(
 pub(crate) fn doc_admit(g: &Inner, h: &ItemHeader, who: &str, owner: bool, now: u64) -> ApiResult<()> {
     use airlox_core::doc::Reject;
     let lim = g.doc_limits;
-    if g.doc_items >= lim.max_items {
+    // A tenth of the saves, like a quarter of the bytes, is the owner's, so
+    // other writers cannot lock the owner out of the plan.
+    let save_cap = if owner { lim.max_items } else { lim.max_items - lim.max_items / 10 };
+    if g.doc_items >= save_cap {
         return Err(ApiError::session_full(
             "this session's doc save limit is reached; export the doc and continue it in a new session",
         ));
@@ -757,14 +762,21 @@ pub(crate) fn doc_admit(g: &Inner, h: &ItemHeader, who: &str, owner: bool, now: 
         return Err(ApiError::limit("too many doc saves this minute; wait a moment"));
     }
     let cap = if owner { lim.max_bytes } else { lim.max_bytes / 4 * 3 };
-    if g.doc_kept_bytes + h.blob_len()? > cap {
+    // A new version also pushes an older one out of the kept set: count only
+    // what the save adds.
+    let place = g.docs.place(h);
+    let freed = match &place {
+        Ok(p) => p.doc().map_or(0, |d| g.doc_bytes_released(d, p.chain(&h.id), owner)),
+        Err(_) => 0,
+    };
+    if (g.doc_kept_bytes + h.blob_len()?).saturating_sub(freed) > cap {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             "doc_full",
             "this session's docs are at their size limit",
         ));
     }
-    match g.docs.place(h) {
+    match place {
         Ok(_) => Ok(()),
         Err(Reject::Stale { chain, head, head_stamp }) => Err(ApiError::conflict_code(
             "stale_base",
@@ -882,7 +894,11 @@ pub async fn post_item(
         }
         if h.kind == ItemKind::Doc {
             // Fail fast, before the upload; checked again when it is stored.
+            // A retry of a post that was stored is a duplicate, not stale.
             let g = s2.lock();
+            if g.items.contains_key(&h.id) {
+                return Err(ApiError::conflict_code("duplicate", "an item with this id already exists"));
+            }
             doc_admit(&g, h, &who2, role == Role::Owner, now_ms())?;
         }
         if role == Role::Runner {
@@ -1041,6 +1057,9 @@ pub async fn want(
             return Err(ApiError::forbidden("this runner is not approved"));
         }
         let r = g.items.get(&item).ok_or_else(|| ApiError::not_found("no such item"))?;
+        if r.doc && role == Role::Runner {
+            return Err(ApiError::forbidden("runners do not receive docs"));
+        }
         if r.blob_present {
             return Err(ApiError::conflict_code("present", "the blob is on the relay; download it"));
         }

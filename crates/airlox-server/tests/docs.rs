@@ -223,3 +223,92 @@ async fn doc_limits() {
     let third = tab(&s, &owner, vec![ItemRef::to(&r)], "2");
     assert_eq!(error_code(post(&env, &s, &owner, frame(&third)).await).await.1, "limit");
 }
+
+#[tokio::test]
+async fn runners_get_no_doc_wants_or_usage() {
+    let env = Env::new().await;
+    let s = doc_session(Mode::Execute);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let r = root(&s, &owner);
+    ok(&env, &s, &owner, &r).await;
+    let runner = join_runner(&env, &s).await;
+    assert_eq!(want(&env, &s, &runner, &r.header().id).await.status(), StatusCode::FORBIDDEN);
+    let usage = |m: &Member| {
+        env.http.get(env.url(&format!("/v1/sessions/{}/usage", s.id))).bearer_auth(&m.token).send()
+    };
+    assert_eq!(usage(&runner).await.unwrap().status(), StatusCode::FORBIDDEN);
+    let u: Value = usage(&owner).await.unwrap().json().await.unwrap();
+    assert_eq!(u["doc_items"], 1);
+    assert!(u["max_doc_items"].as_u64().unwrap() > 0 && u["idle_ttl_ms"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn the_owner_keeps_a_share_of_doc_saves_and_items_are_capped() {
+    let env = Env::with(|c| {
+        c.max_doc_items = 10;
+        c.doc_posts_per_minute = 100;
+    })
+    .await;
+    // Files may be large here; doc items still may not.
+    let s = new_session_with(Mode::Relay, Some(3_600_000), |p| {
+        p.allowed_types.push(ContentType::Doc);
+        p.max_item_bytes = 4 * 1024 * 1024;
+    });
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let a = join(&env, &s, Role::Sender, "a").await;
+    let r = root(&s, &owner);
+    ok(&env, &s, &owner, &r).await;
+    // A doc item larger than a tab can be is refused, whatever it holds.
+    let big = tab(&s, &a, vec![ItemRef::to(&r)], &"x".repeat(1100 * 1024));
+    let (status, _) = error_code(post(&env, &s, &a, frame(&big)).await).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Senders may use 9 of the 10 saves; the last is the owner's.
+    let mut head = tab(&s, &a, vec![ItemRef::to(&r)], "0");
+    ok(&env, &s, &a, &head).await;
+    for i in 1..8 {
+        let next = tab(&s, &a, vec![ItemRef::to(&r), ItemRef::to(&head)], &i.to_string());
+        ok(&env, &s, &a, &next).await;
+        head = next;
+    }
+    let refused = tab(&s, &a, vec![ItemRef::to(&r), ItemRef::to(&head)], "a");
+    assert_eq!(error_code(post(&env, &s, &a, frame(&refused)).await).await.1, "session_full");
+    ok(&env, &s, &owner, &tab(&s, &owner, vec![ItemRef::to(&r), ItemRef::to(&head)], "owner")).await;
+}
+
+#[tokio::test]
+async fn a_save_that_frees_what_it_adds_is_not_refused_for_size() {
+    let blob_len = |i: &SealedItem| i.header().blob_len().unwrap();
+    let env0 = Env::new().await;
+    let s0 = doc_session(Mode::Relay);
+    create(&env0, &s0).await;
+    let o0 = join(&env0, &s0, Role::Owner, "owner").await;
+    let r0 = root(&s0, &o0);
+    let sample = tab(&s0, &o0, vec![ItemRef::to(&r0)], &"y".repeat(1000));
+    // Senders get three quarters: room for the root and one and a half tab
+    // versions, so every save below fits only once the one it replaces goes.
+    let cap = (blob_len(&r0) + blob_len(&sample) * 3 / 2) * 4 / 3 + 4;
+    let env = Env::with(|c| {
+        c.max_doc_bytes = cap;
+        c.doc_keep_versions = 1;
+        c.doc_posts_per_minute = 100;
+    })
+    .await;
+    let s = doc_session(Mode::Relay);
+    create(&env, &s).await;
+    let owner = join(&env, &s, Role::Owner, "owner").await;
+    let a = join(&env, &s, Role::Sender, "a").await;
+    let r = root(&s, &owner);
+    ok(&env, &s, &owner, &r).await;
+    let first = tab(&s, &a, vec![ItemRef::to(&r)], &"y".repeat(1000));
+    ok(&env, &s, &a, &first).await;
+    let mut head = tab(&s, &a, vec![ItemRef::to(&r), ItemRef::to(&first)], &"z".repeat(1000));
+    ok(&env, &s, &a, &head).await;
+    // At the cap, each save pushes the previous one out: still accepted.
+    for i in 0..3 {
+        let next = tab(&s, &a, vec![ItemRef::to(&r), ItemRef::to(&head)], &format!("{i}").repeat(1000));
+        ok(&env, &s, &a, &next).await;
+        head = next;
+    }
+}

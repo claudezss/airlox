@@ -66,7 +66,7 @@ pub enum DocCmd {
 pub struct DocConn {
     #[command(flatten)]
     pub conn: Conn,
-    /// Doc id (or a prefix) or title; default: the only, or latest changed, doc.
+    /// Doc title or id (or a prefix); default: the only doc, or the only one the owner created.
     #[arg(long)]
     pub doc: Option<String>,
 }
@@ -314,6 +314,15 @@ pub(crate) fn tab_json(
     })
 }
 
+/// Participant text between fences with a random tag, so text that imitates
+/// this command's own headers or the closing fence cannot pass for them.
+fn print_fenced(md: &str, author: &str) {
+    let tag = &airlox_core::item::new_item_id()[..8];
+    println!("----- tab text {tag}, written by {author} -----");
+    println!("{}", clean_text(md));
+    println!("----- end of tab text {tag} -----");
+}
+
 fn print_tab(
     s: &Session,
     doc: &Doc,
@@ -353,7 +362,7 @@ fn print_tab(
     match &t.content {
         Some(c) => {
             println!();
-            println!("{}", clean_text(&c.md));
+            print_fenced(&c.md, &who(s, &t.head.author.to_b64()));
         }
         None => println!("\n(this version's content is not available here: evicted before this client got it, or unreadable)"),
     }
@@ -413,7 +422,21 @@ pub async fn doc(cmd: DocCmd) -> Result<i32> {
             let id = match export {
                 Some((t, tabs)) => {
                     let title = title.or(t).context("the export has no readable title; pass one")?;
-                    let note = if note.is_empty() { "Imported from an export".to_string() } else { note };
+                    // The text becomes this participant's own first versions:
+                    // say what is being posted, and mark it as unreviewed.
+                    let names: Vec<String> =
+                        tabs.iter().map(|(n, m)| format!("{} ({} bytes)", clean_line(n), m.len())).collect();
+                    eprintln!(
+                        "importing {:?} with {} tab(s): {}",
+                        clean_line(&title),
+                        tabs.len(),
+                        names.join(", ")
+                    );
+                    let note = if note.is_empty() {
+                        "Imported from an export; not reviewed".to_string()
+                    } else {
+                        note
+                    };
                     s.doc_import(&title, tabs, &note).await?
                 }
                 None => {
@@ -479,15 +502,18 @@ pub async fn doc(cmd: DocCmd) -> Result<i32> {
             let (mut s, doc, st) = open(&a.d).await?;
             let t = Session::tab_find(&st, Some(&a.tab))?;
             let base = base_ref(chain(&doc, t), &a.base)?;
-            let cur = t.content.clone();
+            let cur = t
+                .content
+                .clone()
+                .context("this tab's current version is not readable here, so its name and state are unknown; run `airlox doc show` again")?;
             let to = s.resolve_recipients(&a.to)?;
             let w = DocWrite {
                 doc: doc.id().to_string(),
                 tab: Some(t.id.clone()),
                 base: Some(base),
-                name: cur.as_ref().map_or_else(|| "Untitled".into(), |c| c.name.clone()),
+                name: cur.name,
                 md,
-                deleted: cur.as_ref().is_some_and(|c| c.deleted),
+                deleted: cur.deleted,
                 note: a.note,
                 to,
             };
@@ -539,7 +565,9 @@ pub async fn doc(cmd: DocCmd) -> Result<i32> {
             };
             let title =
                 a.title.or(st.title.clone()).context("the doc's title is unreadable here; pass --title")?;
-            let mut order = Vec::new();
+            // Without --order the current order is kept, deleted tabs included.
+            let mut order: Vec<String> =
+                if a.order.is_empty() { st.tabs.iter().map(|t| t.id.clone()).collect() } else { vec![] };
             for spec in &a.order {
                 let id = Session::tab_find(&st, Some(spec))?.id.clone();
                 if !order.contains(&id) {
@@ -609,15 +637,15 @@ pub async fn doc(cmd: DocCmd) -> Result<i32> {
                     );
                 }
                 ExportFormat::Md => {
-                    println!("# {}\n", st.title.as_deref().unwrap_or("(untitled)"));
+                    println!("# {}\n", st.title.as_deref().map_or_else(|| "(untitled)".into(), clean_line));
                     for t in st.tabs.iter().filter(|t| t.content.as_ref().is_some_and(|c| !c.deleted)) {
                         let c = t.content.as_ref().expect("filtered");
                         println!(
                             "<!-- airlox tab {} {} -->\n## {}\n\n{}\n",
                             t.id,
                             t.stamp,
-                            c.name,
-                            c.md.trim_end()
+                            clean_line(&c.name),
+                            clean_text(c.md.trim_end())
                         );
                     }
                 }
@@ -693,8 +721,8 @@ fn stale_exit(e: anyhow::Error, json_out: bool) -> Result<i32> {
         }
         println!("Merge your change into the current text below and retry with --base {}", st.current);
         if let Some(md) = &st.current_md {
-            println!("# {UNTRUSTED}\n-----");
-            println!("{}", clean_text(md));
+            println!("# {UNTRUSTED}");
+            print_fenced(md, "the current version's author");
         }
     }
     Ok(code)

@@ -367,7 +367,8 @@ fn hops(items: &[Item], index: &HashMap<String, usize>, web: &dyn Fn(&str) -> bo
             if web(&i.author) || run > 1000 {
                 break;
             }
-            if i.kind == "text" {
+            // Doc saves that wake someone are agents talking too.
+            if i.kind == "text" || (i.kind == "doc" && i.to().is_some()) {
                 run += 1;
             }
         }
@@ -2380,6 +2381,13 @@ mod tests {
         items.push(progress);
         items.push(item(11, "b", Some(&["a"]), None));
         assert_eq!(hops_of(&items, 11), 2);
+        // A doc save that wakes someone counts as agent talk.
+        let mut save = item(20, "a", Some(&["b"]), None);
+        save.kind = "doc".into();
+        let mut probe = items.clone();
+        probe.push(save);
+        probe.push(item(21, "b", Some(&["a"]), None));
+        assert_eq!(hops_of(&probe, 21), 4);
         items.push(item(12, "a", None, None));
         assert_eq!(hops_of(&items, 12), 1);
     }

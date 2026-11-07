@@ -3141,9 +3141,24 @@ const docUnseen = (s, t) => {
 };
 
 // Called whenever a doc item arrives or changes state.
+// Rebuilding the doc model reads every doc item, so a burst of items (a
+// session catching up) is coalesced into one rebuild.
 function docChanged(s, it) {
   const d = docState(s);
-  const before = d.model;
+  const p = (d.pending ??= { before: d.model, remote: false, since: Date.now() });
+  p.remote ||= !!it && it.author !== s.me;
+  clearTimeout(p.timer);
+  if (Date.now() - p.since > 500) docFlush(s);
+  else p.timer = setTimeout(() => docFlush(s), 60);
+}
+
+function docFlush(s) {
+  const d = docState(s);
+  const p = d.pending;
+  if (!p) return;
+  clearTimeout(p.timer);
+  d.pending = null;
+  const before = p.before;
   d.model = docModel(s);
   if (!s.docUi) return;
   s.docUi.badge();
@@ -3153,7 +3168,7 @@ function docChanged(s, it) {
   if (d.mode === "edit") return s.docUi.refreshEdit();
   // A reader keeps their place: a new version of the open tab is offered, not swapped in.
   const prevTab = before && doc && before.find((x) => x.id === doc.id)?.tabs.find((x) => x.id === t?.id);
-  if (d.mode === "read" && t && prevTab && prevTab.head.id !== t.head.id && it?.author !== s.me) {
+  if (d.mode === "read" && t && prevTab && prevTab.head.id !== t.head.id && p.remote) {
     d.remote = { shown: prevTab.head };
   }
   s.docUi.render();
@@ -3162,7 +3177,10 @@ function docChanged(s, it) {
 function docCurrent(s) {
   const d = docState(s);
   const docs = d.model || [];
-  return docs.find((x) => x.id === d.sel) || docs.slice().sort((a, b) => b.changed - a.changed)[0] || null;
+  // Without a pick: the owner's docs first (any writer can create one), then
+  // the most recently changed.
+  const byOwner = (x) => (x.meta.versions[0].owner ? 1 : 0);
+  return docs.find((x) => x.id === d.sel) || docs.slice().sort((a, b) => byOwner(b) - byOwner(a) || b.changed - a.changed)[0] || null;
 }
 function docTab(s, doc) {
   const d = docState(s);
@@ -3219,32 +3237,46 @@ let mdLinkHook = null;
 // Render a tab's Markdown; checkboxes tick (when `onTick`) and result links become chips.
 function docMarkdown(s, md, onTick) {
   mdLinkHook = (href) => (href.startsWith("airlox:result/") ? docResultChip(s, href) : null);
+  const lines = md.split("\n");
+  // Task lines in source order, outside code fences, with the text each
+  // should render as.
+  const tasks = [];
   let nodes;
   try {
     nodes = markdown(md);
+    if (onTick) {
+      let fence = null;
+      lines.forEach((l, i) => {
+        const f = l.match(/^\s{0,3}(```+|~~~+)/);
+        if (f) fence = fence ? (l.trimStart().startsWith(fence) ? null : fence) : f[1];
+        else if (!fence) {
+          const m = l.match(/^\s*(?:[-*+]|\d{1,9}[.)])\s+\[([ xX])\]\s+(.*)$/);
+          if (m) tasks.push({ line: i, done: m[1] !== " ", text: el("span", {}, mdInline(m[2])).textContent.trim() });
+        }
+      });
+    }
   } finally {
     mdLinkHook = null;
   }
   const box = el("div", { class: "md doc-md" }, nodes);
   if (onTick) {
-    // Task lines in source order, outside code fences: the same order as the checkboxes.
-    const lines = md.split("\n");
-    const tasks = [];
-    let fence = null;
-    lines.forEach((l, i) => {
-      const f = l.match(/^\s{0,3}(```+|~~~+)/);
-      if (f) fence = fence ? (l.trimStart().startsWith(fence) ? null : fence) : f[1];
-      else if (!fence && /^\s*([-*+]|\d{1,9}[.)])\s+\[[ xX]\]\s+/.test(l)) tasks.push(i);
-    });
-    box.querySelectorAll('input[type="checkbox"]').forEach((cb, k) => {
-      if (tasks[k] === undefined) return;
-      const label = cb.parentElement?.textContent.trim() || "task";
+    // A box is ticked by rewriting its source line, so every rendered box
+    // must be the task line it appears to be: same count, same state, same
+    // text. Text that renders boxes elsewhere (a quote, say) turns ticking
+    // off rather than let one box change another line.
+    const boxes = [...box.querySelectorAll('input[type="checkbox"]')];
+    const label = (cb) => cb.parentElement?.textContent.trim() || "";
+    const lined = boxes.length === tasks.length && boxes.every((cb, k) =>
+      cb.checked === tasks[k].done && label(cb).startsWith(tasks[k].text));
+    if (!lined) return box;
+    boxes.forEach((cb, k) => {
+      const name = label(cb).replace(/\p{C}/gu, "").replace(/\s+/g, " ").trim() || "task";
       cb.disabled = false;
-      cb.setAttribute("aria-label", clip(label, 80));
+      cb.setAttribute("aria-label", clip(name, 80));
       cb.addEventListener("change", () => {
         const next = lines.slice();
-        next[tasks[k]] = next[tasks[k]].replace(/\[[ xX]\]/, cb.checked ? "[x]" : "[ ]");
-        onTick(next.join("\n"), `${cb.checked ? "Done" : "Reopened"}: ${clip(label, 60)}`, cb);
+        next[tasks[k].line] = next[tasks[k].line].replace(/\[[ xX]\]/, cb.checked ? "[x]" : "[ ]");
+        onTick(next.join("\n"), `${cb.checked ? "Done" : "Reopened"}: ${clip(name, 60)}`, cb);
       });
     });
   }
@@ -3298,6 +3330,7 @@ function buildDocView(s, { mainParts, railSet }) {
     pane.hidden = v !== "doc";
     for (const p of mainParts) p.hidden = v === "doc";
     if (v === "doc") {
+      docFlush(s);
       ui.render();
       refreshUsage();
     }
@@ -3346,7 +3379,8 @@ function buildDocView(s, { mainParts, railSet }) {
       const tt = now?.tabs.find((x) => x.id === (t ? t.id : id));
       if (tt) docSeen(s, tt.id, tt.head.id);
       refreshUsage();
-      return { ok: true, stamp: tt?.head.stamp };
+      // The stamp of the version just posted, even if another landed on top.
+      return { ok: true, id, stamp: tt?.chain.versions.find((x) => x.id === id)?.stamp };
     } catch (e) {
       if (e.code === "stale_base") return { ok: false, stale: true };
       throw e;
@@ -3566,7 +3600,10 @@ function buildDocView(s, { mainParts, railSet }) {
           if (r?.stale) say("Someone saved this tab a moment ago, so the tick was not saved. Their version is shown now.");
           else if (r?.ok) toastUndo(`${note} · ${r.stamp}`, () => busy(async () => {
             const now = docCurrent(s)?.tabs.find((x) => x.id === t.id);
-            if (now) await writeTab(doc, now, { md: before }, `Undo: ${note}`);
+            // Undo only the tick: if anyone saved since, writing the old text
+            // would silently drop their change.
+            if (now?.head.id !== r.id) say("Someone saved this tab after your tick, so it was not undone. Untick the box instead.");
+            else await writeTab(doc, now, { md: before }, `Undo: ${note}`);
             ui.render();
           }));
           ui.render();
@@ -3647,7 +3684,9 @@ function buildDocView(s, { mainParts, railSet }) {
             el("div", {}, el("strong", {}, `${[...new Set(newer.map((x) => author(x).name))].join(", ")} saved ${now.head.stamp} after your draft started`),
               el("p", {}, `Your draft is based on ${base?.stamp ?? "an older version"}. Save is off until you merge, so their change can't be lost.`),
               el("div", { class: "row" },
-                el("button", { type: "button", class: "primary small", onclick: () => {
+                el("button", { type: "button", class: "primary small", disabled: !now.content,
+                  title: now.content ? "" : "Their version is still loading", onclick: () => {
+                  if (!now.content) return;
                   d.merging = { mine: dr.md, from: dr.base };
                   dr.md = now.content?.md ?? "";
                   dr.base = now.head.id;

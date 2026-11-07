@@ -576,8 +576,9 @@ class Session:
         return _docs.docs(self)
 
     def doc(self, spec: Union["_docs.Doc", str, None] = None) -> "_docs.Doc":
-        """A doc by id (or a prefix of at least 4 characters) or title;
-        without one, the most recently changed."""
+        """A doc by title or id (or a prefix of at least 4 characters);
+        without one, the only doc, or the only one the owner created. A spec
+        that matches several docs raises ``LookupError``."""
         return _docs.find(self, spec)
 
     def doc_create(self, title: str, md: str = "", *, note: str = "") -> "_docs.Doc":

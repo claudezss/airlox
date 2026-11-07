@@ -421,6 +421,35 @@ impl Inner {
 
     /// Stop keeping the versions of a doc chain that newer ones pushed out:
     /// from now on they are held like any blob.
+    /// Bytes of kept doc blobs that a new version on `chain` would push out
+    /// of the kept set (when its author is not the owner, the owner's
+    /// newest stays kept).
+    pub fn doc_bytes_released(&self, doc: &str, chain: &str, owner: bool) -> u64 {
+        let Some(c) = self.docs.chain(doc, chain) else { return 0 };
+        let kept = c.kept(self.doc_keep);
+        // With the new version at the head, the newest `doc_keep - 1` of
+        // these stay, and the owner's newest unless the new one is the owner's.
+        let keep = self.doc_keep.max(1) - 1;
+        let stay: std::collections::HashSet<&str> = c
+            .versions
+            .iter()
+            .rev()
+            .take(keep)
+            .map(|v| v.item.id.as_str())
+            .chain(if owner {
+                None
+            } else {
+                c.versions.iter().rev().find(|v| v.owner).map(|v| v.item.id.as_str())
+            })
+            .collect();
+        kept.iter()
+            .filter(|id| !stay.contains(**id))
+            .filter_map(|id| self.items.get(*id))
+            .filter(|r| r.keep && r.blob_present)
+            .map(|r| r.blob_len)
+            .sum()
+    }
+
     fn release_doc_versions(&mut self, doc: String, chain: String, ts: u64) {
         let Some(c) = self.docs.chain(&doc, &chain) else { return };
         let kept = c.kept(self.doc_keep);
@@ -666,6 +695,7 @@ impl Inner {
                     .unwrap_or_default();
                 let hold = self.hold_ms.min(RESEED_HOLD_MS);
                 if let Some(r) = self.items.get_mut(item) {
+                    let was_present = r.blob_present;
                     if !r.blob_present {
                         r.blob_present = true;
                         self.held_bytes += r.blob_len;
@@ -676,7 +706,9 @@ impl Inner {
                     r.recipients = wanters;
                     if r.keep {
                         // A kept doc version the disk had lost: kept again.
-                        self.doc_kept_bytes += if r.doc { r.blob_len } else { 0 };
+                        if r.doc && !was_present {
+                            self.doc_kept_bytes += r.blob_len;
+                        }
                     } else {
                         r.evict_at = ts.saturating_add(hold);
                         self.evictions.entry(r.evict_at).or_default().push(item.clone());

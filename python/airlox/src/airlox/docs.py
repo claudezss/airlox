@@ -84,25 +84,30 @@ class Doc:
     incomplete: bool = False
 
     def tab(self, spec: Optional[str] = None) -> DocTab:
-        """A tab by id (or a prefix of at least 4 characters) or name (any
-        case); without one, the first tab that is not deleted."""
+        """A tab by name (any case) or id (or a prefix of at least 4
+        characters); without one, the first tab that is not deleted. A spec
+        matching several tabs prefers live ones, and is refused if that
+        still leaves more than one."""
         if spec is None:
             for t in self.tabs:
                 if not t.deleted:
                     return t
             raise LookupError("this doc has no tabs")
-        by_id = [t for t in self.tabs if len(spec) >= 4 and t.id.startswith(spec)]
-        by_name = [t for t in self.tabs if t.name is not None and t.name.lower() == spec.lower()]
-        if len(by_id) == 1:
-            return by_id[0]
-        if not by_id and len(by_name) == 1:
-            return by_name[0]
-        if not by_id and not by_name:
+        hits = [
+            t
+            for t in self.tabs
+            if (t.name is not None and t.name.lower() == spec.lower())
+            or t.id == spec
+            or (len(spec) >= 4 and t.id.startswith(spec))
+        ]
+        live = [t for t in hits if not t.deleted]
+        if len(hits) == 1:
+            return hits[0]
+        if len(live) == 1:
+            return live[0]
+        if not hits:
             raise LookupError(f"no tab {spec!r} in this doc")
-        live = [t for t in by_name if not t.deleted]
-        if not by_id and len(live) == 1:
-            return live[0]  # a deleted tab may share a live one's name
-        raise LookupError(f"{spec!r} matches several tabs; use its id")
+        raise LookupError(f"{spec!r} matches several tabs; use the tab's full id")
 
 
 class StaleBase(Exception):
@@ -142,7 +147,7 @@ def parse_stamp(s: str) -> Optional[Tuple[int, str]]:
     else:
         return None
     hex8 = hex8.lower()
-    if not n.isdigit() or int(n) < 1 or len(hex8) != 8 or any(c not in "0123456789abcdef" for c in hex8):
+    if not (n.isascii() and n.isdigit()) or int(n) < 1 or len(hex8) != 8 or any(c not in "0123456789abcdef" for c in hex8):
         return None
     return int(n), hex8
 
@@ -245,18 +250,25 @@ def find(s: "Session", spec: Union[Doc, str, None] = None, *, sync: bool = True)
         raise LookupError("this session has no docs yet; create one with doc_create")
     if isinstance(spec, Doc):
         spec = spec.id
+    listing = "\n".join(f"  {d.id}  {d.title or '(untitled)'}" for d in all_docs)
     if spec is None:
-        # The most recently changed.
-        return max(all_docs, key=lambda d: max(t.head.seq for t in d.tabs) if d.tabs else d.meta_versions[-1].seq)
-    by_id = [d for d in all_docs if len(spec) >= 4 and d.id.startswith(spec)]
-    by_title = [d for d in all_docs if d.title is not None and d.title.lower() == spec.lower()]
-    if len(by_id) == 1:
-        return by_id[0]
-    if not by_id and len(by_title) == 1:
-        return by_title[0]
-    if not by_id and not by_title:
+        # Ids and tab order are chosen by writers, so with several docs the
+        # default is only the one the owner created, never a guess.
+        if len(all_docs) == 1:
+            return all_docs[0]
+        by_owner = [d for d in all_docs if d.meta_versions[0].owner]
+        if len(by_owner) == 1:
+            return by_owner[0]
+        raise LookupError(f"this session has several docs; name one of:\n{listing}")
+    hits = [d for d in all_docs if d.title is not None and d.title.lower() == spec.lower()]
+    hits += [
+        d for d in all_docs if (d.id == spec or (len(spec) >= 4 and d.id.startswith(spec))) and d not in hits
+    ]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
         raise LookupError(f"no doc {spec!r} in this session")
-    raise LookupError(f"{spec!r} matches several docs; use its id")
+    raise LookupError(f"{spec!r} matches several docs; use the full id of one of:\n{listing}")
 
 
 # --- writing -------------------------------------------------------------
@@ -386,8 +398,14 @@ def write(
     posted = _post_on(s, d.id, tab_id, base_ref, "tab", meta)
     d = find(s, d.id, sync=False)
     for t in d.tabs:
-        if any(v.id == posted for v in t.versions):
-            return t
+        for i, v in enumerate(t.versions):
+            if v.id == posted:
+                # The tab as of the version just posted: another save may
+                # already be on top of it, and its stamp is not ours.
+                return DocTab(
+                    id=t.id, stamp=v.stamp, versions=t.versions[: i + 1], name=v.name, md=v.md,
+                    deleted=bool(v.deleted), note=v.note,
+                )
     raise RuntimeError("the relay stored the version but it is not in the doc")
 
 
@@ -411,5 +429,8 @@ def set_info(
         "title": title if title is not None else d.title,
         "order": list(order) if order is not None else [t.id for t in d.tabs],
     }
-    _post_on(s, d.id, None, base_ref, "meta", meta)
-    return find(s, d.id, sync=False)
+    posted = _post_on(s, d.id, None, base_ref, "meta", meta)
+    d = find(s, d.id, sync=False)
+    # The stamp of the version just posted, even if another is on top of it.
+    d.stamp = next(v.stamp for v in d.meta_versions if v.id == posted)
+    return d

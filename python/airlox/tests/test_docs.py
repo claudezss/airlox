@@ -75,6 +75,15 @@ def test_tabs_and_info(relay, caches):
         agent.doc_set_info(d2.id, base=d.stamp, title="old")
     assert [x.title for x in agent.docs()] == ["Spec v2"]
 
+    # A sender's doc does not become the default; a second owner doc makes
+    # it ambiguous. A title wins over an id prefix only when it is the sole match.
+    agent.doc_create("Spec v2 notes", "x\n")
+    assert agent.doc().id == doc.id
+    assert agent.doc("spec v2 notes").title == "Spec v2 notes"
+    owner.doc_create("Other", "y\n")
+    with pytest.raises(LookupError, match="several docs"):
+        agent.doc()
+
 
 def test_late_joiner_rebuilds_chain_after_eviction(tmp_path, caches):
     relay = Relay(tmp_path / "relay", blob_hold="1500ms", doc_keep_versions=2).start()
