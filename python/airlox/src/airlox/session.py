@@ -25,7 +25,7 @@ from .execute import Job, NoRunnerAvailable, Runner, RunnerBusy, RunnerFailed, s
 
 log = logging.getLogger(__name__)
 
-DEFAULT_TYPES = ("text", "py", "md", "zip", "image")
+DEFAULT_TYPES = ("text", "py", "md", "zip", "image", "doc")
 MAX_SHELL_BYTES = 64 * 1024
 # The item limit for a relay that does not say what it allows, and the
 # largest default a relay's answer can raise it to.

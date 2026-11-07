@@ -4,6 +4,7 @@
 
 mod cli;
 mod client;
+mod doc_cli;
 mod files;
 mod job;
 mod machine;
@@ -49,6 +50,10 @@ enum Cmd {
     /// `airlox run --on <name>`.
     #[command(subcommand)]
     Machine(machine::MachineCmd),
+    /// Shared docs: tabs of Markdown that any writer edits, one version at
+    /// a time (a write names the version it started from).
+    #[command(subcommand)]
+    Doc(doc_cli::DocCmd),
     /// Print the session's items so far.
     Items(cli::ItemsArgs),
     /// Print items as they arrive.
@@ -192,6 +197,7 @@ fn main() -> std::process::ExitCode {
             Cmd::Cancel(a) => cli::cancel(a).await.map(|()| 0),
             Cmd::Job(cli::JobCmd::Ls(a)) => cli::job_ls(a).await.map(|()| 0),
             Cmd::Machine(c) => machine::machine(c).await.map(|()| 0),
+            Cmd::Doc(c) => doc_cli::doc(c).await,
             Cmd::Items(a) => cli::items(a).await.map(|()| 0),
             Cmd::Watch(a) => cli::watch(a).await.map(|()| 0),
             Cmd::Listen(a) => cli::listen(a).await,

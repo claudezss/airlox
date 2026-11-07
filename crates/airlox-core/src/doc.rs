@@ -453,6 +453,50 @@ pub fn resolve(doc: &Doc, content: impl Fn(&ItemRef) -> Option<Meta>) -> DocStat
     }
 }
 
+/// A line diff from `a` to `b`: `(' ', line)` kept, `('-', line)` removed,
+/// `('+', line)` added. Texts too large to compare line by line come back
+/// as all of `a` removed and all of `b` added.
+pub fn line_diff<'a>(a: &'a str, b: &'a str) -> Vec<(char, &'a str)> {
+    let a: Vec<&str> = a.lines().collect();
+    let b: Vec<&str> = b.lines().collect();
+    // Common prefix and suffix first: most edits touch a few lines.
+    let pre = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let suf = a[pre..].iter().rev().zip(b[pre..].iter().rev()).take_while(|(x, y)| x == y).count();
+    let (am, bm) = (&a[pre..a.len() - suf], &b[pre..b.len() - suf]);
+    let mut out: Vec<(char, &str)> = a[..pre].iter().map(|l| (' ', *l)).collect();
+    if am.len().saturating_mul(bm.len()) > 4_000_000 {
+        out.extend(am.iter().map(|l| ('-', *l)));
+        out.extend(bm.iter().map(|l| ('+', *l)));
+    } else {
+        let (n, m) = (am.len(), bm.len());
+        let mut lcs = vec![vec![0u32; m + 1]; n + 1];
+        for i in (0..n).rev() {
+            for j in (0..m).rev() {
+                lcs[i][j] =
+                    if am[i] == bm[j] { lcs[i + 1][j + 1] + 1 } else { lcs[i + 1][j].max(lcs[i][j + 1]) };
+            }
+        }
+        let (mut i, mut j) = (0, 0);
+        while i < n && j < m {
+            if am[i] == bm[j] {
+                out.push((' ', am[i]));
+                i += 1;
+                j += 1;
+            } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+                out.push(('-', am[i]));
+                i += 1;
+            } else {
+                out.push(('+', bm[j]));
+                j += 1;
+            }
+        }
+        out.extend(am[i..].iter().map(|l| ('-', *l)));
+        out.extend(bm[j..].iter().map(|l| ('+', *l)));
+    }
+    out.extend(a[a.len() - suf..].iter().map(|l| (' ', *l)));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,6 +661,13 @@ mod tests {
         let ids: Vec<&str> = st.tabs.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, [t2.header().id.as_str(), t1.header().id.as_str()]);
         assert_eq!(st.tabs[1].content.as_ref().unwrap().md, "one");
+    }
+
+    #[test]
+    fn diffs_lines() {
+        let d = line_diff("a\nb\nc\n", "a\nB\nc\nd\n");
+        assert_eq!(d, [(' ', "a"), ('-', "b"), ('+', "B"), (' ', "c"), ('+', "d")]);
+        assert!(line_diff("x", "x").iter().all(|(k, _)| *k == ' '));
     }
 
     #[test]

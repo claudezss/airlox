@@ -25,6 +25,9 @@ use crate::client::{self, is_transient, status_of, Relay, RelayError};
 use crate::sse::SseParser;
 use crate::view::write_atomic;
 
+mod docs;
+pub use docs::{DocWrite, StaleBase};
+
 /// Largest believable gap between consecutive event sequence numbers a
 /// participant sees (gaps are only events meant for others, such as job
 /// routing). Small, so one forged event cannot hide the session's future.
@@ -34,7 +37,7 @@ const MAX_SEQ_JUMP: u64 = 10_000;
 const REASK: Duration = Duration::from_secs(5 * 60);
 
 /// Content types a new session allows unless told otherwise.
-pub const DEFAULT_TYPES: &[&str] = &["text", "py", "md", "zip", "image"];
+pub const DEFAULT_TYPES: &[&str] = &["text", "py", "md", "zip", "image", "doc"];
 
 /// `(subkind, mime)` for a file name the protocol can carry.
 pub fn file_type(name: &str) -> Option<(&'static str, &'static str)> {
@@ -164,6 +167,19 @@ impl Cache {
             json!({"seq": seq}).to_string().as_bytes(),
             0o600,
         )
+    }
+
+    /// The version of each doc chain this role last read (chain id → item
+    /// id): a local cursor for "changed since you last read".
+    fn docs_read(&self, role: &str) -> HashMap<String, String> {
+        fs::read(self.dir.join(format!("docs-read-{role}.json")))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_docs_read(&self, role: &str, read: &HashMap<String, String>) -> Result<()> {
+        write_atomic(&self.dir.join(format!("docs-read-{role}.json")), &serde_json::to_vec(read)?, 0o600)
     }
 
     fn load_manifest(&self) -> Option<String> {
@@ -1144,6 +1160,7 @@ impl Session {
             "text" => Some("text"),
             "file" => subkind,
             "job" => Some("py"),
+            "doc" => Some("doc"),
             _ => None,
         };
         let allowed: Vec<String> = serde_json::from_value(json!(self.manifest.allowed_types))?;
