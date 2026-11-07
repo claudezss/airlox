@@ -34,6 +34,8 @@ pub fn test_config(dir: &std::path::Path) -> Config {
     c.listen = "127.0.0.1:0".parse().unwrap();
     c.sweep_interval_ms = 50;
     c.blob_grace_ms = 200;
+    // Tests must not depend on how full the machine's disk is.
+    c.disk_high_watermark = 101;
     c
 }
 

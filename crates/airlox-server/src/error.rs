@@ -9,11 +9,17 @@ pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    /// More fields for the JSON body, merged next to `error` and `message`.
+    pub extra: Option<serde_json::Value>,
 }
 
 impl ApiError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        ApiError { status, code, message: message.into() }
+        ApiError { status, code, message: message.into(), extra: None }
+    }
+    pub fn with(mut self, extra: serde_json::Value) -> Self {
+        self.extra = Some(extra);
+        self
     }
     pub fn bad_request(code: &'static str, m: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, code, m)
@@ -82,7 +88,13 @@ impl From<std::io::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({"error": self.code, "message": self.message}))).into_response()
+        let mut body = json!({"error": self.code, "message": self.message});
+        if let (Some(serde_json::Value::Object(extra)), Some(b)) = (self.extra, body.as_object_mut()) {
+            for (k, v) in extra {
+                b.entry(k).or_insert(v);
+            }
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 

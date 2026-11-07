@@ -42,6 +42,9 @@ pub enum ItemKind {
     /// A runner's signed note that a job is still running: elapsed time and
     /// the tail of a log file the job named.
     Progress,
+    /// A shared doc's root, title/order version or tab version
+    /// (`docs/design/docs.md` §0).
+    Doc,
 }
 
 impl ItemKind {
@@ -53,6 +56,7 @@ impl ItemKind {
             ItemKind::Result => "result",
             ItemKind::Event => "event",
             ItemKind::Progress => "progress",
+            ItemKind::Doc => "doc",
         }
     }
 }
@@ -145,12 +149,24 @@ impl ItemHeader {
                 | (ItemKind::Result, None)
                 | (ItemKind::Event, None)
                 | (ItemKind::Progress, None)
+                | (ItemKind::Doc, Some(C::Root | C::Meta | C::Tab))
         );
         if !ok {
             return Err(Error::invalid(
                 "item header",
                 format!("subkind {:?} not valid for kind {}", self.subkind, self.kind.as_str()),
             ));
+        }
+        // A doc item's refs are its place in the doc: none for the root,
+        // [root] for a new tab, [root, base] for any other version.
+        let doc_refs = match (self.kind, self.subkind) {
+            (ItemKind::Doc, Some(C::Root)) => Some(0..=0),
+            (ItemKind::Doc, Some(C::Meta)) => Some(2..=2),
+            (ItemKind::Doc, Some(C::Tab)) => Some(1..=2),
+            _ => None,
+        };
+        if doc_refs.is_some_and(|r| !r.contains(&self.refs.len())) {
+            return Err(Error::invalid("item header", "doc item has the wrong number of refs"));
         }
         Ok(())
     }

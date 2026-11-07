@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use airlox_core::cert::{RunnerInfo, SignedJoinRequest};
+use airlox_core::doc::DocIndex;
 use airlox_core::encoding::{parse_canonical, sha256};
 use airlox_core::item::{ItemEnvelope, ItemKind};
 use airlox_core::session::{is_session_id, Mode, Role, SignedManifest};
@@ -291,6 +292,9 @@ pub struct ItemRec {
     /// A `progress` item: not logged, not counted toward the session's
     /// history, and forgotten entirely once its blob goes.
     pub progress: bool,
+    /// A `doc` item. While `keep` is set it is one of its chain's kept
+    /// versions; runners never fetch it.
+    pub doc: bool,
 }
 
 pub struct Inner {
@@ -336,6 +340,23 @@ pub struct Inner {
     grace_ms: u64,
     /// Whether runners need the owner's approval before they get jobs.
     approve_runners: bool,
+    /// Shared docs, from the headers of applied `doc` items.
+    pub docs: DocIndex,
+    /// Applied `doc` items, and the bytes of the doc blobs being kept.
+    pub doc_items: usize,
+    pub doc_kept_bytes: u64,
+    /// Recent doc posts per participant (in memory only), for the rate limit.
+    pub doc_posts: HashMap<String, std::collections::VecDeque<u64>>,
+    doc_keep: usize,
+    pub doc_limits: DocLimits,
+}
+
+/// The relay's doc limits, copied from its configuration.
+#[derive(Clone, Copy, Debug)]
+pub struct DocLimits {
+    pub max_items: usize,
+    pub max_bytes: u64,
+    pub posts_per_minute: usize,
 }
 
 impl Inner {
@@ -395,6 +416,32 @@ impl Inner {
                     self.evictions.entry(t).or_default().push(item.to_string());
                 }
             }
+        }
+    }
+
+    /// Stop keeping the versions of a doc chain that newer ones pushed out:
+    /// from now on they are held like any blob.
+    fn release_doc_versions(&mut self, doc: String, chain: String, ts: u64) {
+        let Some(c) = self.docs.chain(&doc, &chain) else { return };
+        let kept = c.kept(self.doc_keep);
+        let out: Vec<String> = c
+            .versions
+            .iter()
+            .filter(|v| !kept.contains(v.item.id.as_str()))
+            .map(|v| v.item.id.clone())
+            .collect();
+        for id in out {
+            let Some(r) = self.items.get_mut(&id) else { continue };
+            if !r.keep {
+                continue;
+            }
+            r.keep = false;
+            if r.blob_present {
+                self.doc_kept_bytes = self.doc_kept_bytes.saturating_sub(r.blob_len);
+            }
+            r.evict_at = r.evict_at.min(ts.saturating_add(self.hold_ms));
+            self.evictions.entry(r.evict_at).or_default().push(id.clone());
+            self.check_delivered(&id, ts);
         }
     }
 
@@ -461,14 +508,20 @@ impl Inner {
                 self.last_activity_ms = self.last_activity_ms.max(ts);
                 Ok(self.push_event(line.seq, "participant", public))
             }
-            Rec::Item { envelope, recipients, blob_len, ip_hash, .. } => {
+            Rec::Item { envelope, recipients, blob_len, ip_hash, blob_sha256 } => {
                 let env: ItemEnvelope =
                     parse_canonical(envelope, "item envelope").map_err(|e| e.to_string())?;
                 let id = env.header.id.clone();
                 let author = env.header.author.to_b64();
-                let keep = env.header.kind == ItemKind::Event
-                    && *blob_len <= KEEP_EVENT_BYTES
-                    && self.participants.get(&author).is_some_and(|p| p.role == Role::Owner);
+                let owner = self.participants.get(&author).is_some_and(|p| p.role == Role::Owner);
+                // A doc item the index takes is kept until newer versions push it out.
+                let doc = env.header.kind == ItemKind::Doc;
+                let place = match (doc, blob_sha256) {
+                    (true, Some(sha)) => self.docs.apply(&env.header, sha, owner, line.seq).ok(),
+                    _ => None,
+                };
+                let keep = place.is_some()
+                    || (env.header.kind == ItemKind::Event && *blob_len <= KEEP_EVENT_BYTES && owner);
                 let evict_at = if keep { u64::MAX } else { ts.saturating_add(self.hold_ms) };
                 let progress = env.header.kind == ItemKind::Progress;
                 self.progress_items += usize::from(progress);
@@ -485,10 +538,22 @@ impl Inner {
                         evict_at,
                         keep,
                         progress,
+                        doc,
                     },
                 );
                 if !keep {
-                    self.evictions.entry(evict_at).or_default().push(id);
+                    self.evictions.entry(evict_at).or_default().push(id.clone());
+                }
+                if doc {
+                    self.doc_items += 1;
+                }
+                if let Some(place) = place {
+                    self.doc_kept_bytes += blob_len;
+                    self.release_doc_versions(
+                        place.doc().unwrap_or(&id).to_string(),
+                        place.chain(&id).to_string(),
+                        ts,
+                    );
                 }
                 self.held_bytes += blob_len;
                 self.transfer_bytes += blob_len;
@@ -565,6 +630,9 @@ impl Inner {
                 if let Some(r) = self.items.get_mut(item) {
                     if r.blob_present {
                         r.blob_present = false;
+                        if r.doc && r.keep {
+                            self.doc_kept_bytes = self.doc_kept_bytes.saturating_sub(r.blob_len);
+                        }
                         self.held_bytes -= r.blob_len;
                         self.usage.sub(r.ip_hash.as_deref(), r.blob_len);
                     }
@@ -604,8 +672,13 @@ impl Inner {
                         self.usage.add(ip_hash.as_deref(), r.blob_len);
                     }
                     r.recipients = wanters;
-                    r.evict_at = ts.saturating_add(hold);
-                    self.evictions.entry(r.evict_at).or_default().push(item.clone());
+                    if r.keep {
+                        // A kept doc version the disk had lost: kept again.
+                        self.doc_kept_bytes += if r.doc { r.blob_len } else { 0 };
+                    } else {
+                        r.evict_at = ts.saturating_add(hold);
+                        self.evictions.entry(r.evict_at).or_default().push(item.clone());
+                    }
                 }
                 self.check_delivered(item, ts);
                 self.last_activity_ms = self.last_activity_ms.max(ts);
@@ -794,6 +867,16 @@ impl Session {
             hold_ms: cfg.blob_hold_ms,
             grace_ms: cfg.blob_grace_ms,
             approve_runners,
+            docs: DocIndex::default(),
+            doc_items: 0,
+            doc_kept_bytes: 0,
+            doc_posts: HashMap::new(),
+            doc_keep: cfg.doc_keep_versions,
+            doc_limits: DocLimits {
+                max_items: cfg.max_doc_items,
+                max_bytes: cfg.max_doc_bytes,
+                posts_per_minute: cfg.doc_posts_per_minute,
+            },
         }
     }
 

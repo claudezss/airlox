@@ -90,6 +90,13 @@ pub enum ContentType {
     /// A shell job's subkind. Never a file type, so never in `allowed_types`:
     /// the manifest's `job_limits.kinds` decides whether shell jobs may run.
     Sh,
+    /// Shared docs: in `allowed_types`, it lets writers post `doc` items.
+    Doc,
+    /// A `doc` item's subkinds (never in `allowed_types`): the doc's first
+    /// item, a version of its title and tab order, and a tab version.
+    Root,
+    Meta,
+    Tab,
 }
 
 impl ContentType {
@@ -101,6 +108,10 @@ impl ContentType {
             ContentType::Zip => "zip",
             ContentType::Image => "image",
             ContentType::Sh => "sh",
+            ContentType::Doc => "doc",
+            ContentType::Root => "root",
+            ContentType::Meta => "meta",
+            ContentType::Tab => "tab",
         }
     }
 }
@@ -288,6 +299,12 @@ impl Manifest {
         }
         if self.allowed_types.is_empty() {
             return Err(Error::invalid("manifest", "allowed_types is empty"));
+        }
+        if [ContentType::Root, ContentType::Meta, ContentType::Tab].iter().any(|t| self.allows(*t)) {
+            return Err(Error::invalid(
+                "manifest",
+                "root, meta and tab are doc subkinds; allow docs with doc",
+            ));
         }
         if self.allows(ContentType::Sh) {
             return Err(Error::invalid(

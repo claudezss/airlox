@@ -259,6 +259,12 @@ pub enum Meta {
     Result(JobResult),
     Event(Event),
     Progress(JobProgress),
+    #[serde(rename = "doc_root")]
+    DocRoot(crate::doc::DocInfo),
+    #[serde(rename = "doc_meta")]
+    DocMeta(crate::doc::DocInfo),
+    #[serde(rename = "doc_tab")]
+    DocTab(crate::doc::DocTab),
 }
 
 impl Meta {
@@ -270,6 +276,7 @@ impl Meta {
             Meta::Result(_) => ItemKind::Result,
             Meta::Event(_) => ItemKind::Event,
             Meta::Progress(_) => ItemKind::Progress,
+            Meta::DocRoot(_) | Meta::DocMeta(_) | Meta::DocTab(_) => ItemKind::Doc,
         }
     }
 }
