@@ -202,12 +202,12 @@ fn tab_name(t: &TabState) -> String {
     t.content.as_ref().map_or_else(|| format!("(unreadable tab {})", &t.id[..8]), |c| clean_line(&c.name))
 }
 
-fn chain<'a>(doc: &'a Doc, t: &TabState) -> &'a Chain {
+pub(crate) fn chain<'a>(doc: &'a Doc, t: &TabState) -> &'a Chain {
     doc.tab(&t.id).expect("state comes from this doc")
 }
 
 /// A stamp from the user, as the full reference of that version.
-fn base_ref(c: &Chain, stamp: &str) -> Result<ItemRef> {
+pub(crate) fn base_ref(c: &Chain, stamp: &str) -> Result<ItemRef> {
     match c.find_stamp(stamp) {
         Some(v) => Ok(v.item.clone()),
         None => bail!(
@@ -227,7 +227,7 @@ fn who(s: &Session, key: &str) -> String {
 }
 
 /// What changed since this participant last read the chain: from-stamp and diff.
-fn since_read(s: &Session, c: &Chain) -> Option<(String, Vec<(char, String)>)> {
+pub(crate) fn since_read(s: &Session, c: &Chain) -> Option<(String, Vec<(char, String)>)> {
     let last = s.doc_last_read(&c.id)?;
     let i = c.versions.iter().position(|v| v.item.id == last)?;
     if i + 1 == c.versions.len() {
@@ -243,7 +243,12 @@ fn since_read(s: &Session, c: &Chain) -> Option<(String, Vec<(char, String)>)> {
     Some((c.stamp_at(i), d))
 }
 
-fn tab_json(s: &Session, doc: &Doc, t: &TabState, since: Option<&(String, Vec<(char, String)>)>) -> Value {
+pub(crate) fn tab_json(
+    s: &Session,
+    doc: &Doc,
+    t: &TabState,
+    since: Option<&(String, Vec<(char, String)>)>,
+) -> Value {
     let c = chain(doc, t);
     json!({
         "id": t.id,
