@@ -78,6 +78,10 @@ class Doc:
     #: In display order, deleted tabs included (check ``deleted``).
     tabs: List[DocTab] = field(default_factory=list)
     meta_versions: List[DocVersion] = field(default_factory=list)
+    #: This client saw doc saves that do not follow from the versions it
+    #: holds. The relay stores only saves that do, so it may be withholding
+    #: some: the history may be incomplete.
+    incomplete: bool = False
 
     def tab(self, spec: Optional[str] = None) -> DocTab:
         """A tab by id (or a prefix of at least 4 characters) or name (any
@@ -152,6 +156,10 @@ def line_diff(a: str, b: str) -> List[Tuple[str, str]]:
 
 
 def _chains(s: "Session") -> List[dict]:
+    return _index(s)["docs"]
+
+
+def _index(s: "Session") -> dict:
     entries = []
     for item in (s._items[i] for i in s._order):
         if item.kind != "doc" or item.author_role not in ("owner", "sender"):
@@ -196,7 +204,7 @@ def _versions(s: "Session", chain: dict) -> List[DocVersion]:
     return out
 
 
-def _resolve(s: "Session", d: dict) -> Doc:
+def _resolve(s: "Session", d: dict, incomplete: bool = False) -> Doc:
     meta_versions = _versions(s, d["meta"])
     head_meta = _content(s, meta_versions[-1].ref)
     tabs = {c["id"]: c for c in d["tabs"]}
@@ -220,13 +228,15 @@ def _resolve(s: "Session", d: dict) -> Doc:
         stamp=meta_versions[-1].stamp,
         tabs=out,
         meta_versions=meta_versions,
+        incomplete=incomplete,
     )
 
 
 def docs(s: "Session", *, sync: bool = True) -> List[Doc]:
     if sync:
         s.sync()
-    return [_resolve(s, d) for d in _chains(s)]
+    ix = _index(s)
+    return [_resolve(s, d, bool(ix["skipped"])) for d in ix["docs"]]
 
 
 def find(s: "Session", spec: Union[Doc, str, None] = None, *, sync: bool = True) -> Doc:

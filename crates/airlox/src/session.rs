@@ -26,7 +26,7 @@ use crate::sse::SseParser;
 use crate::view::write_atomic;
 
 mod docs;
-pub use docs::{DocWrite, StaleBase};
+pub use docs::{DocWrite, StaleBase, INCOMPLETE};
 
 /// Largest believable gap between consecutive event sequence numbers a
 /// participant sees (gaps are only events meant for others, such as job
@@ -1123,6 +1123,34 @@ impl Session {
     /// by item id. Delivered means fetched, not read.
     pub async fn delivery(&self) -> Result<Value> {
         Ok(self.relay.get_json("/delivery").await?["items"].take())
+    }
+
+    /// How much of the session's limits is used (`GET /usage`).
+    pub async fn usage(&self) -> Result<Value> {
+        self.relay.get_json("/usage").await
+    }
+
+    /// Warnings for limits at 80% or more, for doc saves: the session's doc
+    /// save count, its history (items and log bytes) and kept doc bytes.
+    /// Empty when the relay does not report usage.
+    pub async fn doc_limit_warnings(&self) -> Vec<String> {
+        let Ok(u) = self.usage().await else { return vec![] };
+        let mut out = vec![];
+        let mut check = |used: &str, max: &str, what: &str| {
+            let (Some(n), Some(m)) = (u[used].as_u64(), u[max].as_u64()) else { return };
+            if m > 0 && n * 5 >= m * 4 {
+                out.push(format!(
+                    "{what} is {}% full ({n} of {m}); when it is full, saves are refused. \
+                     `airlox doc export --format json` and `airlox doc new --from` continue the doc in a new session.",
+                    n * 100 / m
+                ));
+            }
+        };
+        check("doc_items", "max_doc_items", "this session's doc save limit");
+        check("items", "max_items", "this session's item limit");
+        check("log_bytes", "max_log_bytes", "this session's history");
+        check("doc_bytes", "max_doc_bytes", "this session's doc storage");
+        out
     }
 
     /// Send a file the protocol can carry, as a reply to item `reply_to` if

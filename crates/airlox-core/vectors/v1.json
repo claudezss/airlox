@@ -107,59 +107,64 @@
         "seq": 8
       }
     ],
-    "index": [
-      {
-        "id": "BgYGBgYGBgYGBgYGBgYGBg",
-        "meta": {
+    "index": {
+      "docs": [
+        {
           "id": "BgYGBgYGBgYGBgYGBgYGBg",
-          "versions": [
-            {
-              "author": "F8t5-ytBIPKx7GXkGY1uCLKOgT_rAeSkAIObheGAgM4",
-              "blob_sha256": "xrZX9_0rfhSC5prgs-z4ItjE0rZ-9Z8u1TqokXLyH_M",
-              "created_at_ms": 1761400000014,
-              "id": "BgYGBgYGBgYGBgYGBgYGBg",
-              "owner": true,
-              "seq": 4,
-              "stamp": "v1·c6b657f7"
-            },
-            {
-              "author": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
-              "blob_sha256": "Tik7qOG3Xi06io5941DNE1u5W_YPpbO2Tiv1t0KYBoU",
-              "created_at_ms": 1761400000017,
-              "id": "CQkJCQkJCQkJCQkJCQkJCQ",
-              "owner": false,
-              "seq": 7,
-              "stamp": "v2·4e293ba8"
-            }
-          ]
-        },
-        "tabs": [
-          {
-            "id": "BwcHBwcHBwcHBwcHBwcHBw",
+          "meta": {
+            "id": "BgYGBgYGBgYGBgYGBgYGBg",
             "versions": [
               {
                 "author": "F8t5-ytBIPKx7GXkGY1uCLKOgT_rAeSkAIObheGAgM4",
-                "blob_sha256": "rk9-1eJ901IUlIjbcb114a5eqL1iTgGKg0P_D1_KNoY",
-                "created_at_ms": 1761400000015,
-                "id": "BwcHBwcHBwcHBwcHBwcHBw",
+                "blob_sha256": "xrZX9_0rfhSC5prgs-z4ItjE0rZ-9Z8u1TqokXLyH_M",
+                "created_at_ms": 1761400000014,
+                "id": "BgYGBgYGBgYGBgYGBgYGBg",
                 "owner": true,
-                "seq": 5,
-                "stamp": "v1·ae4f7ed5"
+                "seq": 4,
+                "stamp": "v1·c6b657f7"
               },
               {
                 "author": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
-                "blob_sha256": "af60jXBr7-2-myG-_EW0gqSqC1tarEGWuDfvKvD5iEA",
-                "created_at_ms": 1761400000016,
-                "id": "CAgICAgICAgICAgICAgICA",
+                "blob_sha256": "Tik7qOG3Xi06io5941DNE1u5W_YPpbO2Tiv1t0KYBoU",
+                "created_at_ms": 1761400000017,
+                "id": "CQkJCQkJCQkJCQkJCQkJCQ",
                 "owner": false,
-                "seq": 6,
-                "stamp": "v2·69feb48d"
+                "seq": 7,
+                "stamp": "v2·4e293ba8"
               }
             ]
-          }
-        ]
-      }
-    ]
+          },
+          "tabs": [
+            {
+              "id": "BwcHBwcHBwcHBwcHBwcHBw",
+              "versions": [
+                {
+                  "author": "F8t5-ytBIPKx7GXkGY1uCLKOgT_rAeSkAIObheGAgM4",
+                  "blob_sha256": "rk9-1eJ901IUlIjbcb114a5eqL1iTgGKg0P_D1_KNoY",
+                  "created_at_ms": 1761400000015,
+                  "id": "BwcHBwcHBwcHBwcHBwcHBw",
+                  "owner": true,
+                  "seq": 5,
+                  "stamp": "v1·ae4f7ed5"
+                },
+                {
+                  "author": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc",
+                  "blob_sha256": "af60jXBr7-2-myG-_EW0gqSqC1tarEGWuDfvKvD5iEA",
+                  "created_at_ms": 1761400000016,
+                  "id": "CAgICAgICAgICAgICAgICA",
+                  "owner": false,
+                  "seq": 6,
+                  "stamp": "v2·69feb48d"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "skipped": [
+        "CgoKCgoKCgoKCgoKCgoKCg"
+      ]
+    }
   },
   "inputs": {
     "base_url": "https://airlox.example",

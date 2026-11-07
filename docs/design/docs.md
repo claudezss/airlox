@@ -17,6 +17,21 @@ version and remain a proposal. Where the implementation differs from §0:
 - `vectors/v1.json` gained doc items and a `docs` section (doc_index input and
   answer, with a stale write left out). Earlier items are unchanged; the
   manifest now allows `doc`.
+- `doc_index` returns `{docs, skipped}`. `skipped` lists doc items that do not
+  follow from the versions the client has; the relay stores only items that
+  do, so any there mean history may be incomplete (§0.8). The CLI warns on
+  stderr and in `history_incomplete`, MCP `doc_read` in `warning`, the web in
+  a banner, and the Python SDK in `Doc.incomplete`. This replaces checking
+  for gaps in `seq`, which has gaps by design (progress items, acks).
+- `GET /v1/sessions/{id}/usage` reports item, history and doc counts against
+  their limits, and the idle limit. After each save the CLI and MCP warn at
+  80% of any of them; the web shows the same in the doc view, and its session
+  panel says when a session that never expires is deleted for being idle.
+- `airlox doc new --from export.json` recreates an exported doc's live tabs as
+  first versions in the new session (the title comes from the export).
+- The web renders Markdown with its own renderer, which builds DOM nodes and
+  never parses HTML, instead of markdown-it and DOMPurify. The rules in §0.9
+  are the same.
 
 Originally a proposal (2026-11-07). Builds on [DESIGN.md](../DESIGN.md) §5 (items)
 and §7 (transit buffer, re-seeding), and on [protocol.md](../protocol.md) §6,

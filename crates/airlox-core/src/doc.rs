@@ -262,6 +262,11 @@ impl Reject {
 #[derive(Clone, Debug, Default)]
 pub struct DocIndex {
     docs: BTreeMap<String, Doc>,
+    /// Ids of `doc` items that did not apply, in order. The relay stores
+    /// only items that apply, so on a client any entry here means a save it
+    /// was not shown (or one the relay should have refused): its history may
+    /// be incomplete (`docs/design/docs.md` §0.8).
+    pub skipped: Vec<String>,
 }
 
 impl DocIndex {
@@ -339,7 +344,13 @@ impl DocIndex {
         owner: bool,
         seq: u64,
     ) -> std::result::Result<Place, Reject> {
-        let place = self.place(h)?;
+        let place = match self.place(h) {
+            Ok(p) => p,
+            Err(e) => {
+                self.skipped.push(h.id.clone());
+                return Err(e);
+            }
+        };
         let v = Version {
             item: ItemRef { id: h.id.clone(), blob_sha256: blob_sha256.to_string() },
             author: h.author,

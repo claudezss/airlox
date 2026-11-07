@@ -19,6 +19,7 @@ def test_write_read_and_stale(relay, caches):
     doc = owner.doc_create("Plan", "# Plan\n- [ ] step 1\n", note="first draft")
     assert doc.title == "Plan"
     assert [t.name for t in doc.tabs] == ["Main"]
+    assert not doc.incomplete
     assert parse_stamp(doc.tabs[0].stamp)[0] == 1
 
     ta, tb = a.doc("Plan").tab("main"), b.doc("Plan").tab()

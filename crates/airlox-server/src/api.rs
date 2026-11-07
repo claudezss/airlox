@@ -367,6 +367,32 @@ pub async fn delivery(
     Ok(Json(json!({"items": items})))
 }
 
+/// `GET /v1/sessions/:id/usage` — how much of the session's limits is used,
+/// so clients can warn before saves are refused, and how long the session
+/// may sit with nobody connected before the relay deletes it.
+pub async fn usage(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let s = session(&st, &id)?;
+    auth(&s, &headers)?;
+    let cfg = &st.store.cfg;
+    let g = s.lock();
+    Ok(Json(json!({
+        "items": g.history_items(),
+        "max_items": cfg.max_items,
+        "log_bytes": g.log_len(),
+        "max_log_bytes": cfg.max_log_bytes,
+        "doc_items": g.doc_items,
+        "max_doc_items": g.doc_limits.max_items,
+        "doc_bytes": g.doc_kept_bytes,
+        "max_doc_bytes": g.doc_limits.max_bytes,
+        // Deleted after this long with no stream open and nothing done.
+        "idle_ttl_ms": cfg.idle_ttl_for(s.signed.manifest.expires_at_ms),
+    })))
+}
+
 /// The most recent own items `delivery` reports on.
 const DELIVERY_ITEMS: usize = 500;
 

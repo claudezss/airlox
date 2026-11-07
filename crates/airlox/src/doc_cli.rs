@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use crate::cli::{human_age, Conn};
 use crate::files::{clean_line, clean_text};
-use crate::session::{DocWrite, Session, StaleBase};
+use crate::session::{DocWrite, Session, StaleBase, INCOMPLETE};
 
 /// Exit codes for writes that did not apply.
 pub const EXIT_STALE: i32 = 3;
@@ -31,12 +31,15 @@ pub const UNTRUSTED: &str =
 pub enum DocCmd {
     /// List the session's docs and their tabs.
     Ls(DocConn),
-    /// Create a doc with one tab, Main.
+    /// Create a doc with one tab, Main, or continue an exported one.
     New {
         #[command(flatten)]
         conn: Conn,
-        title: String,
-        /// Main's text, from a file (- for stdin).
+        /// The title; taken from the export when --from is one.
+        title: Option<String>,
+        /// Main's text, from a file (- for stdin). A file from `airlox doc
+        /// export --format json` instead recreates its tabs (deleted ones
+        /// left out) as first versions in this session.
         #[arg(long, value_name = "FILE")]
         from: Option<PathBuf>,
         #[arg(long, default_value = "")]
@@ -181,6 +184,34 @@ pub enum ExportFormat {
     Json,
 }
 
+/// An export's title and its live, readable tabs as `(name, md)`.
+type Export = (Option<String>, Vec<(String, String)>);
+
+/// An `airlox doc export --format json` file. `None` when `text` is not one
+/// (it is Markdown).
+fn parse_export(text: &str) -> Result<Option<Export>> {
+    let Ok(v) = serde_json::from_str::<Value>(text) else { return Ok(None) };
+    let Some(tabs) = v.get("tabs").and_then(Value::as_array) else { return Ok(None) };
+    let mut out = Vec::new();
+    for t in tabs {
+        let c = &t["content"];
+        if c.is_null() {
+            eprintln!(
+                "skipping tab {}: its text was not readable when exported",
+                t["id"].as_str().unwrap_or("?")
+            );
+            continue;
+        }
+        if c["deleted"].as_bool() == Some(true) {
+            continue;
+        }
+        let name = c["name"].as_str().context("an exported tab has no name")?;
+        let md = c["md"].as_str().context("an exported tab has no text")?;
+        out.push((name.to_string(), md.to_string()));
+    }
+    Ok(Some((v["title"].as_str().map(str::to_string), out)))
+}
+
 fn read_input(p: &PathBuf) -> Result<String> {
     if p.as_os_str() == "-" {
         let mut s = String::new();
@@ -195,7 +226,19 @@ async fn open(d: &DocConn) -> Result<(Session, Doc, DocState)> {
     let mut s = d.conn.join().await?;
     s.sync().await?;
     let (doc, st) = s.doc_find(d.doc.as_deref())?;
+    if s.doc_history_incomplete() {
+        eprintln!("warning: {INCOMPLETE}");
+    }
     Ok((s, doc, st))
+}
+
+/// After a save: limits at 80% or more, on stderr. Returns them for JSON.
+async fn limit_warnings(s: &Session) -> Vec<String> {
+    let w = s.doc_limit_warnings().await;
+    for x in &w {
+        eprintln!("warning: {x}");
+    }
+    w
 }
 
 fn tab_name(t: &TabState) -> String {
@@ -349,17 +392,35 @@ pub async fn doc(cmd: DocCmd) -> Result<i32> {
                     println!("  {:<24} {}{deleted}{new}", tab_name(t), t.stamp);
                 }
             }
+            let incomplete = !ix.skipped.is_empty();
+            if incomplete {
+                eprintln!("warning: {INCOMPLETE}");
+            }
             if d.conn.json {
-                println!("{}", serde_json::to_string_pretty(&json!({"docs": out}))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"docs": out, "history_incomplete": incomplete}))?
+                );
             } else if ix.is_empty() {
                 println!("no docs yet; create one with `airlox doc new \"Title\"`");
             }
             Ok(0)
         }
         DocCmd::New { conn, title, from, note } => {
-            let md = from.as_ref().map(read_input).transpose()?.unwrap_or_default();
+            let text = from.as_ref().map(read_input).transpose()?.unwrap_or_default();
+            let export = parse_export(&text)?;
             let mut s = conn.join().await?;
-            let id = s.doc_create(&title, &md, &note).await?;
+            let id = match export {
+                Some((t, tabs)) => {
+                    let title = title.or(t).context("the export has no readable title; pass one")?;
+                    let note = if note.is_empty() { "Imported from an export".to_string() } else { note };
+                    s.doc_import(&title, tabs, &note).await?
+                }
+                None => {
+                    let title = title.context("pass the doc's title")?;
+                    s.doc_create(&title, &text, &note).await?
+                }
+            };
             let (doc, st) = s.doc_find(Some(&id))?;
             let main = &st.tabs[0];
             if conn.json {
@@ -407,6 +468,7 @@ pub async fn doc(cmd: DocCmd) -> Result<i32> {
                         "untrusted": UNTRUSTED,
                         "doc": {"id": st.id, "title": st.title, "stamp": st.meta_stamp, "base": st.meta_head.item},
                         "tabs": shown,
+                        "history_incomplete": s.doc_history_incomplete(),
                     }))?
                 );
             }
@@ -486,8 +548,9 @@ pub async fn doc(cmd: DocCmd) -> Result<i32> {
             }
             match s.doc_set_info(doc.id(), &base, &title, order).await {
                 Ok(stamp) => {
+                    let warnings = limit_warnings(&s).await;
                     if a.d.conn.json {
-                        println!("{}", json!({"applied": true, "stamp": stamp}));
+                        println!("{}", json!({"applied": true, "stamp": stamp, "warnings": warnings}));
                     } else {
                         println!("applied doc {stamp}");
                     }
@@ -596,8 +659,9 @@ async fn write(s: &mut Session, w: DocWrite, json_out: bool) -> Result<i32> {
     let name = clean_line(&w.name);
     match s.doc_write(w).await {
         Ok((tab, stamp)) => {
+            let warnings = limit_warnings(s).await;
             if json_out {
-                println!("{}", json!({"applied": true, "tab": tab, "stamp": stamp}));
+                println!("{}", json!({"applied": true, "tab": tab, "stamp": stamp, "warnings": warnings}));
             } else {
                 println!("applied {name} {stamp}");
             }

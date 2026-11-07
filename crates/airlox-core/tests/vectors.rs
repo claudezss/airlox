@@ -14,7 +14,7 @@ use airlox_core::payload::Payload;
 use airlox_core::policy;
 use airlox_core::session::{Role, SessionParams, SessionSecrets, SignedManifest};
 use airlox_core::Error;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const FILE: &str = include_str!("../vectors/v1.json");
 
@@ -201,6 +201,8 @@ fn doc_chains_from_headers() {
     let index: Value =
         serde_json::from_str(&api::doc_index(&serde_json::to_string(entries).unwrap()).unwrap()).unwrap();
     assert_eq!(index, v["docs"]["index"]);
+    assert_eq!(ix.skipped, vec![rejected[0].0.clone()]);
+    assert_eq!(index["skipped"], json!([rejected[0].0]));
     // A digest the author did not sign is refused.
     let e = &entries[0];
     assert!(api::item_ref_from_digest(st(&e["envelope"]), st(&entries[1]["blob_sha256"])).is_err());

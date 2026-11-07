@@ -326,10 +326,12 @@ struct DocEntry {
 
 /// The session's docs from its `doc` items (`entries_json`: a JSON list of
 /// `{envelope, blob_sha256, owner, seq}`, in relay order, from owners and
-/// senders only). Returns `[{id, meta: chain, tabs: [chain]}]`, each chain
-/// `{id, versions: [{id, blob_sha256, author, owner, seq, created_at_ms,
-/// stamp}]}` with tabs in creation order. Entries that do not apply are
-/// left out, as the relay left them out.
+/// senders only). Returns `{docs: [{id, meta: chain, tabs: [chain]}],
+/// skipped: [item id]}`, each chain `{id, versions: [{id, blob_sha256,
+/// author, owner, seq, created_at_ms, stamp}]}` with tabs in creation order.
+/// Entries that do not apply are left out of `docs` and listed in `skipped`:
+/// the relay stores only items that apply, so any there mean this client's
+/// history may be incomplete.
 pub fn doc_index(entries_json: &str) -> Result<String> {
     let entries: Vec<DocEntry> = serde_json::from_str(entries_json)?;
     let mut ix = crate::doc::DocIndex::default();
@@ -353,7 +355,7 @@ pub fn doc_index(entries_json: &str) -> Result<String> {
         .docs()
         .map(|d| serde_json::json!({"id": d.id(), "meta": chain(&d.meta), "tabs": d.tabs.iter().map(chain).collect::<Vec<_>>()}))
         .collect();
-    json(&docs)
+    json(&serde_json::json!({"docs": docs, "skipped": ix.skipped}))
 }
 
 /// Check a doc payload's meta (`doc_root`, `doc_meta` or `doc_tab` JSON)

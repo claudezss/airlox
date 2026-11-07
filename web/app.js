@@ -1604,6 +1604,19 @@ function buildSessionLayout(s) {
     el("summary", {}, "Invites"),
     el("div", { class: "stack" }, el("p", { class: "muted hint-text" }, MASKED_NOTE), Object.values(inviteRows))) : null;
   const fresh = el("p", { class: "muted fresh", role: "status" });
+  // When the relay deletes the session: at expiry, or after its idle limit
+  // with nobody connected (a session that never expires has one too).
+  const ends = manifest.expires_at_ms === null ? "Never expires: it lasts until the owner closes it"
+    : `Expires ${new Date(manifest.expires_at_ms).toLocaleString()}`;
+  const lifetime = el("p", { class: "muted" }, ends);
+  api("GET", `/v1/sessions/${sid}/usage`, { token: identity.token }).then((r) => r.json()).then((u) => {
+    if (!u.idle_ttl_ms) return;
+    const days = Math.round(u.idle_ttl_ms / 86400000);
+    const idle = u.idle_ttl_ms >= 86400000 ? `${days} day${days === 1 ? "" : "s"}` : fmtDuration(u.idle_ttl_ms / 1000);
+    lifetime.textContent = manifest.expires_at_ms === null
+      ? `Never expires, but the relay deletes it after ${idle} with nobody connected. Export docs you want to keep.`
+      : `${ends}, or sooner after ${idle} with nobody connected`;
+  }).catch(() => {});
   const runnerList = el("ul", { class: "runners" });
   const runnerNote = el("p", { class: "muted" });
   const rail = el("aside", { class: "rail", id: "rail", "aria-label": "Session details", tabindex: -1 },
@@ -1618,8 +1631,7 @@ function buildSessionLayout(s) {
     el("section", { class: "stack" }, el("h2", {}, "Session"),
       el("p", { class: "mono muted" }, sid),
       fresh,
-      el("p", { class: "muted" }, manifest.expires_at_ms === null ? "Never expires: it lasts until the owner closes it"
-        : `Expires ${new Date(manifest.expires_at_ms).toLocaleString()}`),
+      lifetime,
       el("p", { class: "muted" }, `Files up to ${fmtBytes(manifest.max_item_bytes)}`),
       invites, access, auditBtn, auditDone, auditHint, auditErr, closeBtn, closeErr),
     el("section", { class: "stack" }, el("h2", {}, "This browser"),
@@ -3090,11 +3102,15 @@ function docModel(s) {
     .sort((a, b) => a.seq - b.seq)
     .map((it) => ({ envelope: it.envelope, blob_sha256: it.ref.blob_sha256, owner: it.role === "owner", seq: it.seq }));
   let docs = [];
+  let skipped = [];
   try {
-    docs = JSON.parse(ac.docIndex(JSON.stringify(entries)));
+    ({ docs, skipped } = JSON.parse(ac.docIndex(JSON.stringify(entries))));
   } catch (e) {
     console.warn("doc index failed", e);
   }
+  // The relay stores only saves that follow from the current versions, so
+  // one that does not fit here means this page was not shown some.
+  const incomplete = skipped.length > 0;
   return docs.map((d) => {
     const head = (c) => c.versions[c.versions.length - 1];
     const info = docContent(s, head(d.meta));
@@ -3107,7 +3123,7 @@ function docModel(s) {
     const tabs = order.map((c) => ({ id: c.id, chain: c, head: head(c), content: docContent(s, head(c)) }));
     const changed = Math.max(...[d.meta, ...d.tabs].map((c) => head(c).seq));
     return { id: d.id, root: { id: d.meta.versions[0].id, blob_sha256: d.meta.versions[0].blob_sha256 },
-      meta: d.meta, metaHead: head(d.meta), title: info?.title ?? null, tabs, changed };
+      meta: d.meta, metaHead: head(d.meta), title: info?.title ?? null, tabs, changed, incomplete };
   });
 }
 
@@ -3281,8 +3297,23 @@ function buildDocView(s, { mainParts, railSet }) {
     docLink.setAttribute("aria-pressed", String(v === "doc"));
     pane.hidden = v !== "doc";
     for (const p of mainParts) p.hidden = v === "doc";
-    if (v === "doc") ui.render();
+    if (v === "doc") {
+      ui.render();
+      refreshUsage();
+    }
   };
+  // Limits at 80% or more, from the relay's usage counts: saves are refused
+  // once one is full.
+  const LIMITS = [["doc_items", "max_doc_items", "doc saves"], ["items", "max_items", "items"],
+    ["log_bytes", "max_log_bytes", "history space"], ["doc_bytes", "max_doc_bytes", "doc storage"]];
+  const refreshUsage = () => api("GET", `/v1/sessions/${s.sid}/usage`, { token: s.identity.token }).then((r) => r.json()).then((u) => {
+    const warn = LIMITS.filter(([n, m]) => u[m] > 0 && u[n] * 5 >= u[m] * 4)
+      .map(([n, m, what]) => `This session has used ${u[n] >= u[m] ? "all" : `${Math.floor((u[n] * 100) / u[m])}%`} of its ${what}. Once it is all used, saves are refused: export the doc (airlox doc export --format json) and continue it in a new session with airlox doc new --from.`);
+    if (warn.join() !== (d.limits || []).join()) {
+      d.limits = warn;
+      if (d.view === "doc") ui.render();
+    }
+  }).catch(() => {});
   chatLink.addEventListener("click", () => setView("chat"));
   docLink.addEventListener("click", () => setView("doc"));
 
@@ -3314,6 +3345,7 @@ function buildDocView(s, { mainParts, railSet }) {
       const now = docCurrent(s);
       const tt = now?.tabs.find((x) => x.id === (t ? t.id : id));
       if (tt) docSeen(s, tt.id, tt.head.id);
+      refreshUsage();
       return { ok: true, stamp: tt?.head.stamp };
     } catch (e) {
       if (e.code === "stale_base") return { ok: false, stale: true };
@@ -3502,6 +3534,12 @@ function buildDocView(s, { mainParts, railSet }) {
         canWrite ? el("button", { type: "button", class: "primary small", onclick: () => ui.startEdit(t) }, d.drafts.has(t.id) ? "Resume draft" : "Edit") : null,
         menu);
       const notes = [];
+      if (doc.incomplete) {
+        notes.push(el("div", { class: "doc-banner warn", role: "status" },
+          el("span", {}, el("strong", {}, "History may be incomplete. "),
+            "This page received doc saves that do not follow from the versions it has, so the relay may not have shown it some. Reload; if this stays, compare stamps with the others before you edit.")));
+      }
+      for (const w of d.limits || []) notes.push(el("div", { class: "doc-banner warn", role: "status" }, w));
       if (d.remote?.shown && v.id !== t.head.id) {
         notes.push(el("div", { class: "doc-banner info", role: "status" }, el("span", {}, el("strong", {}, author(t.head).name), ` saved ${t.head.stamp}${t.content?.note ? ` · “${t.content.note}”` : ""}`),
           el("button", { type: "button", class: "small", onclick: () => {

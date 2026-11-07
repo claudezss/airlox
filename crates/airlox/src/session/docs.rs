@@ -68,7 +68,19 @@ impl std::fmt::Display for StaleBase {
 
 impl std::error::Error for StaleBase {}
 
+/// Shown when [`Session::doc_history_incomplete`] is true.
+pub const INCOMPLETE: &str = "history may be incomplete: this client got doc saves that do not follow from \
+the versions it has, so the relay may not have shown it some. Sync again; if this stays, compare stamps with \
+the other participants before you edit.";
+
 impl Session {
+    /// Whether some doc save this client holds does not follow from the
+    /// versions it has. The relay stores only saves that do, so it may be
+    /// withholding some (`docs/design/docs.md` §0.8).
+    pub fn doc_history_incomplete(&self) -> bool {
+        !self.doc_index().skipped.is_empty()
+    }
+
     /// Every doc in the session, from item headers in relay order. Items
     /// from anyone but the owner or a sender are left out.
     pub fn doc_index(&self) -> DocIndex {
@@ -208,6 +220,51 @@ impl Session {
             to: vec![],
         })
         .await?;
+        Ok(root)
+    }
+
+    /// Create a doc titled `title` with these tabs (`(name, md)`, in order;
+    /// a single empty Main when there are none), as when continuing an
+    /// exported doc in a new session. Returns the doc id.
+    pub async fn doc_import(
+        &mut self,
+        title: &str,
+        tabs: Vec<(String, String)>,
+        note: &str,
+    ) -> Result<String> {
+        if tabs.len() > airlox_core::doc::MAX_TABS {
+            bail!("a doc has at most {} tabs", airlox_core::doc::MAX_TABS);
+        }
+        if tabs.is_empty() {
+            return self.doc_create(title, "", note).await;
+        }
+        let info = DocInfo { v: DOC_V, title: title.to_string(), order: vec![] };
+        airlox_core::doc::check_info(&info)?;
+        for (name, md) in &tabs {
+            let t = DocTab {
+                v: DOC_V,
+                name: name.clone(),
+                md: md.clone(),
+                deleted: false,
+                note: note.into(),
+                to: None,
+            };
+            airlox_core::doc::check_tab(&t)?;
+        }
+        let root = self.post_doc("root", vec![], Meta::DocRoot(info)).await?;
+        for (name, md) in &tabs {
+            self.doc_write(DocWrite {
+                doc: root.clone(),
+                tab: None,
+                base: None,
+                name: name.clone(),
+                md: md.clone(),
+                deleted: false,
+                note: note.to_string(),
+                to: vec![],
+            })
+            .await?;
+        }
         Ok(root)
     }
 

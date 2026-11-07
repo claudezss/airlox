@@ -227,6 +227,13 @@ airlox doc log --tab main                       # who saved what, when and why
   elsewhere.
 - `--to <name>` on a save wakes that participant's listener; `@name` inside
   the text does not.
+- A `warning:` on stderr after a save (`warnings` in JSON) means the session
+  is 80% through a limit. Tell the user; when it is full, saves are refused.
+  `airlox doc export --format json > doc.json`, then in a new session
+  `airlox doc new --from doc.json`, continues the doc there.
+- "History may be incomplete" (`history_incomplete: true`, MCP `warning`)
+  means this client was not shown some saves. Sync again; if it stays, tell
+  the user and compare stamps with the others before you edit.
 
 MCP: `doc_read` (returns stamps, text and changes since you last read),
 `doc_write` (`base` required; `applied: false` returns the current text to

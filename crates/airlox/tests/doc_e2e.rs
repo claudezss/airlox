@@ -120,3 +120,63 @@ async fn writers_race_and_late_joiners_agree() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn export_continues_in_a_new_session_and_limits_warn() {
+    let env = Env::with(|c| c.max_doc_items = 5).await;
+    let mk = || new_session_with(Mode::Relay, Some(3_600_000), |p| p.allowed_types.push(ContentType::Doc));
+    let (s1, s2) = (mk(), mk());
+    create(&env, &s1).await;
+    create(&env, &s2).await;
+    let o1 = Invite::owner(&env.base, &s1.secrets).unwrap().to_url();
+    let o2 = Invite::owner(&env.base, &s2.secrets).unwrap().to_url();
+    let dir = tempfile::tempdir().unwrap();
+    let (c1, c2) = (dir.path().join("1"), dir.path().join("2"));
+    let export = dir.path().join("export.json");
+
+    tokio::task::spawn_blocking(move || {
+        // Root and Main: 2 of 5 saves.
+        let new = airlox(&o1, &c1, "owner", &["doc", "new", "Plan", "--from", "-", "--json"], Some("goal\n"));
+        assert!(new.status.success(), "{}", String::from_utf8_lossy(&new.stderr));
+        assert_eq!(json_of(&new)["tab"]["md"], "goal\n");
+        // A third tab-save, then a fourth: 4 of 5 is 80%, so it warns.
+        let add = |name: &str, md: &str| {
+            airlox(&o1, &c1, "owner", &["doc", "tab", "add", name, "--file", "-", "--json"], Some(md))
+        };
+        let a = add("Progress", "- [x] one\n");
+        assert!(a.status.success(), "{}", String::from_utf8_lossy(&a.stderr));
+        assert_eq!(json_of(&a)["warnings"], serde_json::json!([]));
+        let b = add("Gone", "x\n");
+        let v = json_of(&b);
+        assert!(v["warnings"][0].as_str().unwrap().contains("80% full"), "{v}");
+        assert!(String::from_utf8_lossy(&b.stderr).contains("warning:"));
+        let gone = v["tab"].as_str().unwrap().to_string();
+        let base = v["stamp"].as_str().unwrap().to_string();
+        // The fifth save fills it; the sixth is refused.
+        let rm = airlox(&o1, &c1, "owner", &["doc", "tab", "rm", &gone, "--base", &base, "--json"], None);
+        assert!(rm.status.success(), "{}", String::from_utf8_lossy(&rm.stderr));
+        let full = add("More", "y\n");
+        assert!(!full.status.success());
+        assert!(String::from_utf8_lossy(&full.stderr).contains("export the doc"));
+
+        // Export, and continue it in the other session.
+        let out = airlox(&o1, &c1, "owner", &["doc", "export", "--format", "json"], None);
+        assert!(out.status.success());
+        std::fs::write(&export, &out.stdout).unwrap();
+        let new =
+            airlox(&o2, &c2, "owner", &["doc", "new", "--from", export.to_str().unwrap(), "--json"], None);
+        assert!(new.status.success(), "{}", String::from_utf8_lossy(&new.stderr));
+        let ls = json_of(&airlox(&o2, &c2, "owner", &["doc", "ls", "--json"], None));
+        assert_eq!(ls["history_incomplete"], false);
+        let doc = &ls["docs"][0];
+        assert_eq!(doc["title"], "Plan");
+        let names: Vec<&str> =
+            doc["tabs"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["Main", "Progress"], "the deleted tab is left out");
+        let show = json_of(&airlox(&o2, &c2, "owner", &["doc", "show", "--tab", "progress", "--json"], None));
+        assert_eq!(show["tabs"][0]["md"], "- [x] one\n");
+        assert_eq!(show["history_incomplete"], false);
+    })
+    .await
+    .unwrap();
+}

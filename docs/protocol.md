@@ -716,6 +716,7 @@ sends nothing for 30 seconds is answered with `408`.
 | `GET /v1/sessions/{id}/items/{item}/blob` | bearer | none | `200` ciphertext, or `410 evicted` |
 | `POST /v1/sessions/{id}/items/{item}/ack` | bearer, recipient | none | `204` |
 | `GET /v1/sessions/{id}/delivery` | bearer | none | `200 {"items": {id: {"seq", "delivered": [participant_pub…], "waiting": [participant_pub…]}}}` for the caller's own most recent 500 items: who acked each one, and which live recipients the relay still holds it for. Ack means stored, not read |
+| `GET /v1/sessions/{id}/usage` | bearer | none | `200 {"items", "max_items", "log_bytes", "max_log_bytes", "doc_items", "max_doc_items", "doc_bytes", "max_doc_bytes", "idle_ttl_ms"}`: how much of the session's limits is used (clients warn at 80%), and how long it may sit with no stream open and nothing done before the relay deletes it |
 | `POST /v1/sessions/{id}/items/{item}/want` | bearer, never received it | none | `202 {"open": true}`; `409 present` if the blob is on the relay |
 | `PUT /v1/sessions/{id}/items/{item}/blob` | bearer, while wanted | ciphertext | `204`; `409 present` or `409 not_wanted` |
 | `POST /v1/sessions/{id}/roles/{role}/revoke` | bearer, owner | none | `204`; `role` is `sender`, `observer` or `runner` |

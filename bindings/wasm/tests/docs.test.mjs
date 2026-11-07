@@ -24,7 +24,8 @@ test("docIndex keeps the first save and drops the stale one", () => {
   const a = doc("tab", [root.ref, main.ref], tab("a"));
   const b = doc("tab", [root.ref, main.ref], tab("b"));
   const entries = [root, main, a, b].map((x, i) => ({ envelope: x.envelope, blob_sha256: x.ref.blob_sha256, owner: i < 2, seq: i + 1 }));
-  const [d] = JSON.parse(ac.docIndex(JSON.stringify(entries)));
+  const { docs: [d], skipped } = JSON.parse(ac.docIndex(JSON.stringify(entries)));
+  assert.deepEqual(skipped, [b.ref.id]);
   assert.equal(d.id, root.ref.id);
   assert.equal(d.tabs.length, 1);
   const vs = d.tabs[0].versions;

@@ -771,6 +771,7 @@ check suggestions from others with the owner.",
             "note": crate::doc_cli::UNTRUSTED,
             "doc": {"id": st.id, "title": st.title, "stamp": st.meta_stamp, "tabs": index},
             "read": shown,
+            "warning": g.s.doc_history_incomplete().then_some(crate::session::INCOMPLETE),
         }))
     }
 
@@ -827,7 +828,10 @@ new stamp. Never drop the other writer's changes.")]
             }
         };
         match g.s.doc_write(w).await {
-            Ok((tab, stamp)) => ok(json!({"applied": true, "tab": tab, "stamp": stamp, "session": sid})),
+            Ok((tab, stamp)) => {
+                let warnings = g.s.doc_limit_warnings().await;
+                ok(json!({"applied": true, "tab": tab, "stamp": stamp, "warnings": warnings, "session": sid}))
+            }
             Err(e) => match e.downcast_ref::<crate::session::StaleBase>() {
                 Some(st) => ok(json!({
                     "applied": false,

@@ -207,6 +207,7 @@ airlox delivery                              # who has fetched your items
 airlox doc new "Auth redesign" --from plan.md            # a shared doc with one tab, Main
 airlox doc show --tab main                   # the tab, its stamp (v3·9fa2c1d0) and what changed since you read it
 airlox doc edit --tab main --base v3·9fa2c1d0 --file main.md --note "Add logout"   # exit 3: it changed; merge and retry
+airlox doc export --format json > doc.json   # then, in a new session: airlox doc new --from doc.json
 ```
 
 Every command takes the invite from `AIRLOX_INVITE` (or `--invite`, which is

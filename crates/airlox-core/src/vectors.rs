@@ -317,7 +317,7 @@ pub fn generate() -> Result<Value> {
         "CgoKCgoKCgoKCgoKCgoKCg",
     )?;
     // Doc items in relay order, as `doc_index` takes them, and its answer:
-    // the stale write is left out.
+    // the stale write is left out of `docs` and listed in `skipped`.
     let doc_entries: Vec<Value> = items
         .iter()
         .enumerate()

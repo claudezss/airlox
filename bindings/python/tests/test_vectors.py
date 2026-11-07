@@ -226,10 +226,12 @@ def test_shell_jobs_need_the_manifest_to_allow_them():
 def test_doc_chains_from_headers():
     entries = VEC["docs"]["entries"]
     assert json.loads(ac.doc_index(json.dumps(entries))) == VEC["docs"]["index"]
+    # The write on an old base is listed: a client that sees one warns.
+    assert VEC["docs"]["index"]["skipped"] == [json.loads(entries[-1]["envelope"])["header"]["id"]]
     for e in entries:
         ref = json.loads(ac.item_ref_from_digest(e["envelope"], e["blob_sha256"]))
         assert ref["blob_sha256"] == e["blob_sha256"]
     with pytest.raises(ac.AirloxError):
         ac.item_ref_from_digest(entries[0]["envelope"], entries[1]["blob_sha256"])
-    stamps = [v["stamp"] for v in VEC["docs"]["index"][0]["tabs"][0]["versions"]]
+    stamps = [v["stamp"] for v in VEC["docs"]["index"]["docs"][0]["tabs"][0]["versions"]]
     assert [s[:2] for s in stamps] == ["v1", "v2"]
