@@ -10,11 +10,12 @@
 use serde_json::{json, Value};
 
 use crate::cert::{issue_cert, sign_join, ClientKind, JoinRequest, RunnerInfo, SandboxKind};
+use crate::doc::{DocInfo, DocTab, DOC_V};
 use crate::encoding::{b64e, canonical_json};
 use crate::invite::Invite;
 use crate::item::{item_key, seal_with_nonce, ItemKind, ItemRef, NewItem, SealedItem};
 use crate::keys::Keypair;
-use crate::payload::{JobResult, JobSpec, JobStatus, OutFile, Payload, Target};
+use crate::payload::{JobResult, JobSpec, JobStatus, Meta, OutFile, Payload, Target};
 use crate::session::{ContentType, JobKind, JobLimits, Mode, Role, SessionParams, SessionSecrets};
 use crate::Result;
 
@@ -59,6 +60,7 @@ pub fn generate() -> Result<Value> {
             ContentType::Md,
             ContentType::Zip,
             ContentType::Image,
+            ContentType::Doc,
         ],
         max_item_bytes: 26_214_400,
         job_limits: Some(JobLimits {
@@ -245,6 +247,88 @@ pub fn generate() -> Result<Value> {
         Payload::result(result),
         "BQUFBQUFBQUFBQUFBQUFBQ",
     )?;
+
+    // A shared doc: the owner creates it with a Main tab, a sender writes v2
+    // and reorders; a second write on v1 comes after v2 and is stale.
+    let owner_p = Keypair::from_seed(&participants[0].1);
+    let doc = |meta: Meta| Payload { meta, body: vec![] };
+    let tab = |md: &str, note: &str, to: Option<Vec<crate::keys::PublicKey>>| {
+        doc(Meta::DocTab(DocTab {
+            v: DOC_V,
+            name: "Main".into(),
+            md: md.into(),
+            deleted: false,
+            note: note.into(),
+            to,
+        }))
+    };
+    let root = seal_case(
+        "doc_root",
+        &owner_p,
+        Role::Owner,
+        ItemKind::Doc,
+        Some(ContentType::Root),
+        vec![],
+        doc(Meta::DocRoot(DocInfo { v: DOC_V, title: "Orders cleanup".into(), order: vec![] })),
+        "BgYGBgYGBgYGBgYGBgYGBg",
+    )?;
+    let v1 = seal_case(
+        "doc_tab_create",
+        &owner_p,
+        Role::Owner,
+        ItemKind::Doc,
+        Some(ContentType::Tab),
+        vec![ItemRef::to(&root)],
+        tab("# Plan\n- [ ] dedupe\n", "first draft", None),
+        "BwcHBwcHBwcHBwcHBwcHBw",
+    )?;
+    seal_case(
+        "doc_tab_version",
+        &sender,
+        Role::Sender,
+        ItemKind::Doc,
+        Some(ContentType::Tab),
+        vec![ItemRef::to(&root), ItemRef::to(&v1)],
+        tab("# Plan\n- [x] dedupe\n", "deduped", Some(vec![owner_p.public()])),
+        "CAgICAgICAgICAgICAgICA",
+    )?;
+    seal_case(
+        "doc_meta",
+        &sender,
+        Role::Sender,
+        ItemKind::Doc,
+        Some(ContentType::Meta),
+        vec![ItemRef::to(&root), ItemRef::to(&root)],
+        doc(Meta::DocMeta(DocInfo {
+            v: DOC_V,
+            title: "Orders cleanup (done)".into(),
+            order: vec![v1.header().id.clone()],
+        })),
+        "CQkJCQkJCQkJCQkJCQkJCQ",
+    )?;
+    seal_case(
+        "doc_tab_stale",
+        &sender,
+        Role::Sender,
+        ItemKind::Doc,
+        Some(ContentType::Tab),
+        vec![ItemRef::to(&root), ItemRef::to(&v1)],
+        tab("# Plan\n- [ ] dedupe\n- [ ] export\n", "", None),
+        "CgoKCgoKCgoKCgoKCgoKCg",
+    )?;
+    // Doc items in relay order, as `doc_index` takes them, and its answer:
+    // the stale write is left out.
+    let doc_entries: Vec<Value> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| it["new_item"]["kind"] == "doc")
+        .map(|(seq, it)| {
+            json!({"envelope": it["envelope_canonical"], "blob_sha256": it["blob_sha256"],
+                   "owner": it["author_role"] == "owner", "seq": seq})
+        })
+        .collect();
+    let doc_index: Value =
+        serde_json::from_str(&crate::api::doc_index(&serde_json::to_string(&doc_entries)?)?)?;
     sealed_items.push(text);
 
     // Negative cases built from the first item.
@@ -290,6 +374,7 @@ pub fn generate() -> Result<Value> {
             "signed_canonical": s(canonical_json(&join)?),
         },
         "items": items,
+        "docs": {"entries": doc_entries, "index": doc_index},
         "negative_items": [
             {"name": "flipped_blob_byte", "envelope_canonical": s(canonical_json(&base.envelope)?),
              "blob": b64e(&flipped), "expect": "signature"},

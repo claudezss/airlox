@@ -537,6 +537,11 @@ async function clearSession(sid) {
   await tx("identity", "readwrite", (o) => o.delete(range(sid)));
   await tx("events", "readwrite", (o) => o.delete(range(sid)));
   await tx("blobs", "readwrite", (o) => o.delete(range(sid)));
+  for (const store of [sessionStorage, localStorage]) {
+    try {
+      for (const k of Object.keys(store)) if (k.startsWith(`airlox-doc-drafts:${sid}:`) || k.startsWith(`airlox-doc-seen:${sid}:`)) store.removeItem(k);
+    } catch {}
+  }
 }
 
 // ---------- HTTP ----------
@@ -3013,8 +3018,45 @@ const DOC_MAX_MD = 256 * 1024;
 const DOC_UNTRUSTED = "Written by participants. Only the owner's text sets the plan.";
 
 function docState(s) {
-  return (s.doc ??= { view: "chat", sel: null, tab: null, mode: "read", hist: null, drafts: new Map(), merging: null,
+  return (s.doc ??= { view: "chat", sel: null, tab: null, mode: "read", hist: null, drafts: new DocDrafts(s), merging: null,
     remote: null, since: null, model: null, seen: docSeenLoad(s), feedAll: false });
+}
+
+// Unsaved edits to existing tabs. Kept in sessionStorage, beside the invite,
+// so a reload keeps them but nothing stays on disk in the clear once the tab
+// closes. New-tab drafts are not kept.
+class DocDrafts extends Map {
+  constructor(s) {
+    super();
+    this.key = `airlox-doc-drafts:${s.sid}:${s.inv.role}`;
+    try {
+      for (const [k, v] of Object.entries(JSON.parse(sessionStorage.getItem(this.key) || "{}"))) {
+        if (typeof v?.md === "string" && typeof v.base === "string") super.set(k, { md: v.md, base: v.base, note: String(v.note ?? "") });
+      }
+    } catch {}
+  }
+  set(k, v) {
+    super.set(k, v);
+    this.save();
+    return this;
+  }
+  delete(k) {
+    const r = super.delete(k);
+    this.save();
+    return r;
+  }
+  save() {
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => {
+      const keep = Object.fromEntries([...this].filter(([k, v]) => !k.startsWith("new:") && v.base));
+      try {
+        if (Object.keys(keep).length) sessionStorage.setItem(this.key, JSON.stringify(keep));
+        else sessionStorage.removeItem(this.key);
+      } catch {
+        // Too large or refused: the draft still lives in this page.
+      }
+    }, 300);
+  }
 }
 
 const docSeenKey = (s) => `airlox-doc-seen:${s.sid}:${s.inv.role}`;
@@ -3537,6 +3579,7 @@ function buildDocView(s, { mainParts, railSet }) {
       const preview = () => pv.replaceChildren(docMarkdown(s, dr.md, null));
       ta.addEventListener("input", () => {
         dr.md = ta.value;
+        d.drafts.save();
         preview();
         refresh();
       });
@@ -3546,7 +3589,10 @@ function buildDocView(s, { mainParts, railSet }) {
           save.click();
         }
       });
-      noteIn.addEventListener("input", () => (dr.note = noteIn.value));
+      noteIn.addEventListener("input", () => {
+        dr.note = noteIn.value;
+        d.drafts.save();
+      });
       // Only the banner and the save bar change when a new version arrives,
       // so the cursor and undo history survive.
       const refresh = () => {
@@ -3567,6 +3613,7 @@ function buildDocView(s, { mainParts, railSet }) {
                   d.merging = { mine: dr.md, from: dr.base };
                   dr.md = now.content?.md ?? "";
                   dr.base = now.head.id;
+                  d.drafts.save();
                   ui.render();
                   page.querySelector("textarea")?.focus();
                 } }, `Merge into ${now.head.stamp}`),

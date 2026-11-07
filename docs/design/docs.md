@@ -9,7 +9,14 @@ version and remain a proposal. Where the implementation differs from §0:
   requires `base`.
 - `listen` wakes only on `to` keys. It does not wake on a rejected write; the
   writer's own command reports that.
-- Drafts in the web editor live in the page and are lost on reload.
+- Drafts of existing tabs in the web editor are kept in `sessionStorage`
+  (beside the invite): they survive a reload and are dropped when the browser
+  tab closes, so no plaintext stays on disk. New-tab drafts are not kept.
+- The Python SDK has `Session.docs()`, `doc()`, `doc_create()`, `doc_write()`
+  and `doc_set_info()`; a stale write raises `StaleBase`.
+- `vectors/v1.json` gained doc items and a `docs` section (doc_index input and
+  answer, with a stale write left out). Earlier items are unchanged; the
+  manifest now allows `doc`.
 
 Originally a proposal (2026-11-07). Builds on [DESIGN.md](../DESIGN.md) §5 (items)
 and §7 (transit buffer, re-seeding), and on [protocol.md](../protocol.md) §6,

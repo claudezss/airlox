@@ -170,3 +170,38 @@ fn negative_items_fail_as_expected() {
         }
     }
 }
+
+#[test]
+fn doc_chains_from_headers() {
+    use airlox_core::doc::{DocIndex, Reject};
+    let v = v();
+    let entries = v["docs"]["entries"].as_array().unwrap();
+    let mut ix = DocIndex::default();
+    let mut rejected = Vec::new();
+    for e in entries {
+        let env: ItemEnvelope =
+            airlox_core::encoding::parse_canonical(st(&e["envelope"]), "item envelope").unwrap();
+        // The relay's digest is accepted only because the author signed it.
+        let r: ItemRef = serde_json::from_str(
+            &api::item_ref_from_digest(st(&e["envelope"]), st(&e["blob_sha256"])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(r.id, env.header.id);
+        if let Err(rej) = ix.apply(
+            &env.header,
+            st(&e["blob_sha256"]),
+            e["owner"].as_bool().unwrap(),
+            e["seq"].as_u64().unwrap(),
+        ) {
+            rejected.push((env.header.id.clone(), rej));
+        }
+    }
+    assert_eq!(rejected.len(), 1, "only the write on an old base is refused");
+    assert!(matches!(&rejected[0].1, Reject::Stale { head_stamp, .. } if head_stamp.starts_with("v2")));
+    let index: Value =
+        serde_json::from_str(&api::doc_index(&serde_json::to_string(entries).unwrap()).unwrap()).unwrap();
+    assert_eq!(index, v["docs"]["index"]);
+    // A digest the author did not sign is refused.
+    let e = &entries[0];
+    assert!(api::item_ref_from_digest(st(&e["envelope"]), st(&entries[1]["blob_sha256"])).is_err());
+}

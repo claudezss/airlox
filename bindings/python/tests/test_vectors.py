@@ -221,3 +221,15 @@ def test_shell_jobs_need_the_manifest_to_allow_them():
     key, env, blob = seal("job", "py", SHELL_JOB)
     with pytest.raises(ac.AirloxError):
         ac.open_checked(shell_manifest(), sender, key, env, blob)
+
+
+def test_doc_chains_from_headers():
+    entries = VEC["docs"]["entries"]
+    assert json.loads(ac.doc_index(json.dumps(entries))) == VEC["docs"]["index"]
+    for e in entries:
+        ref = json.loads(ac.item_ref_from_digest(e["envelope"], e["blob_sha256"]))
+        assert ref["blob_sha256"] == e["blob_sha256"]
+    with pytest.raises(ac.AirloxError):
+        ac.item_ref_from_digest(entries[0]["envelope"], entries[1]["blob_sha256"])
+    stamps = [v["stamp"] for v in VEC["docs"]["index"][0]["tabs"][0]["versions"]]
+    assert [s[:2] for s in stamps] == ["v1", "v2"]

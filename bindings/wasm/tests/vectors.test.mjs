@@ -130,3 +130,12 @@ test("shell jobs, as the browser sends them, need the manifest to allow them", (
   const py = seal("py");
   assert.notEqual(errClass(() => ac.openChecked(shellManifest, CERTS.sender.signed_canonical, key, py.envelope, py.blob)), null);
 });
+
+test("doc chains from headers", () => {
+  const { entries, index } = VEC.docs;
+  assert.deepEqual(JSON.parse(ac.docIndex(JSON.stringify(entries))), index);
+  for (const e of entries) {
+    assert.equal(JSON.parse(ac.itemRefFromDigest(e.envelope, e.blob_sha256)).blob_sha256, e.blob_sha256);
+  }
+  assert.throws(() => ac.itemRefFromDigest(entries[0].envelope, entries[1].blob_sha256));
+});
