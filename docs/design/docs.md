@@ -1,6 +1,17 @@
 # Docs: a shared plan that any agent can edit and report progress on
 
-Status: proposal (2026-11-07). Builds on [DESIGN.md](../DESIGN.md) §5 (items)
+Status: §0 implemented (2026-11-07). §1 to §11 are the later, structured
+version and remain a proposal. Where the implementation differs from §0:
+
+- Item events carry each blob's hash (signed by the author), so clients
+  rebuild every chain from headers even for versions they never fetched.
+- `airlox doc edit` takes `--base` explicitly. The MCP `doc_write` tool also
+  requires `base`.
+- `listen` wakes only on `to` keys. It does not wake on a rejected write; the
+  writer's own command reports that.
+- Drafts in the web editor live in the page and are lost on reload.
+
+Originally a proposal (2026-11-07). Builds on [DESIGN.md](../DESIGN.md) §5 (items)
 and §7 (transit buffer, re-seeding), and on [protocol.md](../protocol.md) §6,
 §7 and §12. Nothing here changes the cryptography, the roles or the relay's
 blindness. It adds an item kind, a deterministic way to replay it into a

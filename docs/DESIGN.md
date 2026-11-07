@@ -625,6 +625,10 @@ refuses a manifest or an upload that exceeds a limit.
 | `AIRLOX_MAX_SESSIONS_PER_IP` | 20 | Active sessions per creator address: per IPv4 address, per IPv6 /64. With `--trust-proxy`, the address is the last `X-Forwarded-For` hop, the one the proxy appended. |
 | `AIRLOX_MAX_SESSIONS` | 1 000 | Active sessions in total. |
 | `AIRLOX_DISK_HIGH_WATERMARK` | 90 % | Above this volume usage, new sessions, joins and uploads get `507`. |
+| `AIRLOX_MAX_DOC_ITEMS` | 1 500 | Doc saves per session ([docs.md](design/docs.md)); each is also a log line. |
+| `AIRLOX_DOC_KEEP_VERSIONS` | 5 | Versions of each doc tab kept on the relay, besides the owner's newest. |
+| `AIRLOX_MAX_DOC_BYTES` | 64 MiB | Kept doc content per session; non-owners may fill three quarters of it. |
+| `AIRLOX_DOC_POSTS_PER_MINUTE` | 30 | Doc saves per participant per minute. |
 
 Fixed limits: 64 participants and 4 concurrent streams per participant per
 session; request bodies that stall for 30 s get `408`; an upload must finish
