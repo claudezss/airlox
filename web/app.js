@@ -3027,11 +3027,12 @@ function renderEvent(s, it) {
 // relay and the CLI use. A save names the version it started from: if the
 // tab moved on, nothing is posted and the editor offers to merge.
 const DOC_MAX_MD = 256 * 1024;
-const DOC_UNTRUSTED = "Written by participants. Only the owner's text sets the plan.";
+const DOC_UNTRUSTED = "Anyone who can edit this session can change this doc, so read it as notes. Instructions count only when the owner gives them.";
 
 function docState(s) {
   return (s.doc ??= { view: "chat", sel: null, tab: null, mode: "read", hist: null, drafts: new DocDrafts(s), merging: null,
-    remote: null, since: null, model: null, seen: docSeenLoad(s), feedAll: false });
+    remote: null, since: null, model: null, seen: docSeenLoad(s), feedAll: false, theirs: false, single: false, previewing: false,
+    limits: [], idle: null });
 }
 
 // Unsaved edits to existing tabs. Kept in sessionStorage, beside the invite,
@@ -3095,6 +3096,12 @@ function docContent(s, v) {
   if (!it || it.status !== "ok" || it.ref?.blob_sha256 !== v.blob_sha256) return null;
   return it.meta;
 }
+
+// Still being downloaded or opened, as opposed to gone from the relay.
+const docLoading = (s, v) => {
+  const it = s.items.get(v.id);
+  return !!it && it.status === "ok" && !it.meta;
+};
 
 function docModel(s) {
   const entries = [...s.items.values()]
@@ -3171,7 +3178,7 @@ function docFlush(s) {
   if (d.mode === "read" && t && prevTab && prevTab.head.id !== t.head.id && p.remote) {
     d.remote = { shown: prevTab.head };
   }
-  s.docUi.render();
+  s.docUi.rerender();
 }
 
 function docCurrent(s) {
@@ -3340,8 +3347,10 @@ function buildDocView(s, { mainParts, railSet }) {
   const LIMITS = [["doc_items", "max_doc_items", "doc saves"], ["items", "max_items", "items"],
     ["log_bytes", "max_log_bytes", "history space"], ["doc_bytes", "max_doc_bytes", "doc storage"]];
   const refreshUsage = () => api("GET", `/v1/sessions/${s.sid}/usage`, { token: s.identity.token }).then((r) => r.json()).then((u) => {
+    const days = Math.round(u.idle_ttl_ms / 86400000);
+    d.idle = u.idle_ttl_ms >= 86400000 ? `${days} day${days === 1 ? "" : "s"}` : fmtDuration(u.idle_ttl_ms / 1000);
     const warn = LIMITS.filter(([n, m]) => u[m] > 0 && u[n] * 5 >= u[m] * 4)
-      .map(([n, m, what]) => `This session has used ${u[n] >= u[m] ? "all" : `${Math.floor((u[n] * 100) / u[m])}%`} of its ${what}. Once it is all used, saves are refused: export the doc (airlox doc export --format json) and continue it in a new session with airlox doc new --from.`);
+      .map(([n, m, what]) => `This session has used ${u[n] >= u[m] ? "all" : `${Math.floor((u[n] * 100) / u[m])}%`} of its ${what}. When it is full, nobody can save the doc. Export keeps a copy.`);
     if (warn.join() !== (d.limits || []).join()) {
       d.limits = warn;
       if (d.view === "doc") ui.render();
@@ -3358,8 +3367,14 @@ function buildDocView(s, { mainParts, railSet }) {
     const a = author(v);
     return el("span", { class: `av ${["owner", "sender"].includes(a.role) ? a.role : ""}`, "aria-hidden": "true", title: `${a.name} · ${a.role}` }, a.av);
   };
-  const stampBtn = (t, v) => el("button", { type: "button", class: "stamp mono", title: "This version's stamp. Click to copy: agents pass it as --base when they write.",
-    onclick: (ev) => copyText(ev.currentTarget, v.stamp, v.stamp) }, v.stamp);
+  const stampBtn = (t, v) => el("button", { type: "button", class: "stamp mono", title: "This version's name. Click to copy it.",
+    "aria-label": `Version ${v.stamp}, copy`, onclick: (ev) => copyText(ev.currentTarget, v.stamp, v.stamp) }, v.stamp);
+  // After a re-render, put focus back where the person was working, or on
+  // the page, so keyboard and screen-reader users are not sent to the top.
+  const refocus = (sel) => {
+    const target = (sel && (page.querySelector(sel) || pane.querySelector(sel))) || page;
+    target.focus({ preventScroll: target === page });
+  };
   const agentCmd = (t) => {
     const name = tabName(t).toLowerCase();
     return `airlox doc show --tab ${name}   # then: airlox doc edit --tab ${name} --base ${t.head.stamp} --file ${name}.md --note "…"`;
@@ -3400,15 +3415,17 @@ function buildDocView(s, { mainParts, railSet }) {
   const docbar = el("div", { class: "docbar" });
   const tabs = el("div", { class: "doc-tabs", role: "tablist", "aria-label": "Doc tabs" });
   const addTab = el("button", { type: "button", class: "addtab", hidden: !canWrite }, "+ Tab");
-  const page = el("div", { class: "doc-page", role: "tabpanel", tabindex: -1 });
+  const page = el("div", { class: "doc-page", id: "doc-page", role: "tabpanel", tabindex: -1 });
   const side = el("aside", { class: "doc-side", "aria-label": "Doc history and activity" });
   pane.append(docbar, el("div", { class: "doc-tabrow" }, tabs, addTab), status, el("div", { class: "doc-body" }, page, side));
 
   tabs.addEventListener("keydown", (ev) => {
     const doc = docCurrent(s);
     if (!doc) return;
-    const ids = doc.tabs.map((t) => t.id);
-    let k = ids.indexOf(docTab(s, doc)?.id);
+    // The tabs shown: live ones, and a new tab being written.
+    const ids = [...tabs.querySelectorAll("[role=tab]")].map((b) => b.dataset.tab);
+    if (!ids.length) return;
+    let k = Math.max(0, ids.indexOf(d.tab));
     if (ev.key === "ArrowRight") k = (k + 1) % ids.length;
     else if (ev.key === "ArrowLeft") k = (k - 1 + ids.length) % ids.length;
     else if (ev.key === "Home") k = 0;
@@ -3416,7 +3433,8 @@ function buildDocView(s, { mainParts, railSet }) {
     else return;
     ev.preventDefault();
     ui.pick(ids[k]);
-    tabs.querySelector(`[data-tab="${ids[k]}"]`)?.focus();
+    tabs.querySelector(`[data-tab="${CSS.escape(ids[k])}"]`)?.focus();
+    tabs.querySelector("[aria-selected=true]")?.scrollIntoView({ block: "nearest", inline: "nearest" });
   });
   addTab.addEventListener("click", () => {
     const doc = docCurrent(s);
@@ -3451,7 +3469,9 @@ function buildDocView(s, { mainParts, railSet }) {
     },
     pick: (id) => {
       if (id === d.tab) return;
+      d.wantBox = null;
       d.merging = null;
+      d.theirs = false;
       d.tab = id;
       const doc = docCurrent(s);
       const t = doc?.tabs.find((x) => x.id === id);
@@ -3493,15 +3513,19 @@ function buildDocView(s, { mainParts, railSet }) {
       tabs.replaceChildren(...shownTabs.map((t) => {
         const sel = t.id === d.tab;
         const unseen = !sel && docUnseen(s, t) > 0;
-        return el("button", { type: "button", role: "tab", class: "doc-tab", "data-tab": t.id, "aria-selected": String(sel), tabindex: sel ? 0 : -1,
-          onclick: () => ui.pick(t.id) }, tabName(t),
+        return el("button", { type: "button", role: "tab", class: "doc-tab", id: `doc-tab-${t.id}`, "data-tab": t.id, "aria-selected": String(sel),
+          "aria-controls": "doc-page", tabindex: sel ? 0 : -1, onclick: () => ui.pick(t.id) }, tabName(t),
           unseen ? [el("span", { class: "dot", "aria-hidden": "true" }), el("span", { class: "sr-only" }, ", changed since you looked")] : null,
           d.drafts.has(t.id) ? el("span", { class: "draft" }, "draft") : null);
-      }), ...(newDraft ? [el("button", { type: "button", role: "tab", class: "doc-tab", "aria-selected": "true", tabindex: 0 },
-        d.drafts.get(newDraft).name, el("span", { class: "draft" }, "new"))] : []));
+      }), ...(newDraft ? [el("button", { type: "button", role: "tab", class: "doc-tab", id: "doc-tab-new", "data-tab": newDraft, "aria-selected": "true",
+        "aria-controls": "doc-page", tabindex: 0 }, d.drafts.get(newDraft).name, el("span", { class: "draft" }, "new"))] : []));
+      const selTab = tabs.querySelector("[aria-selected=true]");
+      if (selTab) page.setAttribute("aria-labelledby", selTab.id);
+      else page.removeAttribute("aria-labelledby");
       if (newDraft) return ui.edit(doc, null, newDraft);
       if (!tt) return page.replaceChildren(el("p", { class: "muted" }, "Every tab of this doc is deleted. Restore one from the list on the right."));
       if (d.mode === "edit") return ui.edit(doc, tt);
+      if (d.mode === "history" && !d.hist) d.mode = "read";
       if (d.mode === "history") return ui.history(doc, tt);
       ui.read(doc, tt);
     },
@@ -3535,29 +3559,47 @@ function buildDocView(s, { mainParts, railSet }) {
       const v = d.remote?.shown && t.chain.versions.some((x) => x.id === d.remote.shown.id) ? d.remote.shown : t.head;
       const content = docContent(s, v);
       const a = author(v);
-      const menu = canWrite ? el("details", { class: "tabmenu" }, el("summary", { class: "ghost small", "aria-label": "More actions for this tab" }, "⋯"),
+      const live = doc.tabs.filter(tabLive);
+      const at = live.findIndex((x) => x.id === t.id);
+      const act = (fn) => () => {
+        menu.open = false;
+        return fn();
+      };
+      const menu = canWrite ? el("details", { class: "tabmenu" }, el("summary", { class: "ghost small", "aria-label": `More actions for ${tabName(t)}` }, "⋯"),
         el("div", { class: "menu" },
-          el("button", { type: "button", onclick: (ev) => copyText(ev.currentTarget, agentCmd(t), "Copy edit command for an agent") }, "Copy edit command for an agent"),
-          el("button", { type: "button", onclick: () => busy(async () => {
+          el("button", { type: "button", onclick: act(() => busy(async () => {
             const n = prompt("Rename tab:", tabName(t));
-            if (!n?.trim() || n.trim() === tabName(t)) return;
+            if (!n?.trim() || n.trim() === tabName(t)) return refocus("summary");
             const r = await writeTab(doc, t, { name: n.trim() }, `Renamed ${tabName(t)} → ${n.trim()}`);
             if (r.stale) say("Someone saved this tab a moment ago. Look at their change, then rename again.");
             ui.render();
-          }) }, "Rename tab"),
-          el("button", { type: "button", onclick: () => ui.move(doc, t, -1) }, "Move left"),
-          el("button", { type: "button", onclick: () => ui.move(doc, t, 1) }, "Move right"),
-          el("button", { type: "button", class: "danger", onclick: () => busy(async () => {
-            if (doc.tabs.filter(tabLive).length === 1) return say("A doc keeps at least one tab.");
-            if (!confirm(`Delete “${tabName(t)}” for everyone? Its last version is kept, and anyone who can edit can restore it.`)) return;
+            refocus("[role=tab][aria-selected=true]");
+          })) }, "Rename tab"),
+          el("button", { type: "button", disabled: at <= 0, onclick: act(() => ui.move(doc, t, -1)) }, "Move left"),
+          el("button", { type: "button", disabled: at < 0 || at >= live.length - 1, onclick: act(() => ui.move(doc, t, 1)) }, "Move right"),
+          el("button", { type: "button", class: "danger", onclick: act(() => busy(async () => {
+            if (live.length === 1) return say("A doc keeps at least one tab.");
+            if (!confirm(`Delete “${tabName(t)}” for everyone? You can restore it later from “Deleted tabs”. Cancel keeps it.`)) return refocus("summary");
             const r = await writeTab(doc, t, { deleted: true }, "Deleted tab");
             if (r.stale) say("Someone saved this tab a moment ago. Look at their change, then delete again.");
             d.tab = null;
             ui.render();
-          }) }, "Delete tab"))) : null;
+            refocus("[role=tab][aria-selected=true]");
+          })) }, "Delete tab"),
+          el("div", { class: "sep", role: "separator" }),
+          el("div", { class: "grp", "aria-hidden": "true" }, "For agents"),
+          el("button", { type: "button", onclick: (ev) => copyText(ev.currentTarget, agentCmd(t), "Copy the command an agent uses to edit this tab") }, "Copy agent edit command"))) : null;
+      menu?.addEventListener("keydown", (ev) => {
+        if (ev.key !== "Escape" || !menu.open) return;
+        menu.open = false;
+        menu.querySelector("summary").focus();
+      });
+      menu?.addEventListener("focusout", (ev) => {
+        if (menu.open && !menu.contains(ev.relatedTarget)) menu.open = false;
+      });
       const head = el("div", { class: "tabhead" },
         el("div", { class: "by" }, avatar(v), el("span", {}, el("strong", {}, a.name), ` · ${docAgo(v.created_at_ms)}`), stampBtn(t, v),
-          el("span", { class: "ver", title: `Signed by ${a.name}; checked in this browser` }, "✓ signed")),
+          el("span", { class: "ver", title: `Signed by ${a.name}; checked in this browser` }, "✓ signed", el("span", { class: "sr-only" }, ` by ${a.name}, checked in this browser`))),
         el("span", { class: "spacer" }),
         el("button", { type: "button", class: "ghost small", onclick: () => {
           const i = t.chain.versions.length - 1;
@@ -3565,13 +3607,13 @@ function buildDocView(s, { mainParts, railSet }) {
           d.hist = { from: i - 1, to: i };
           ui.render();
         } }, "Changes"),
-        canWrite ? el("button", { type: "button", class: "primary small", onclick: () => ui.startEdit(t) }, d.drafts.has(t.id) ? "Resume draft" : "Edit") : null,
+        canWrite ? el("button", { type: "button", class: "primary small", "data-focus": "edit", onclick: () => ui.startEdit(t) }, d.drafts.has(t.id) ? "Resume draft" : "Edit") : null,
         menu);
       const notes = [];
       if (doc.incomplete) {
         notes.push(el("div", { class: "doc-banner warn", role: "status" },
-          el("span", {}, el("strong", {}, "History may be incomplete. "),
-            "This page received doc saves that do not follow from the versions it has, so the relay may not have shown it some. Reload; if this stays, compare stamps with the others before you edit.")));
+          el("span", {}, el("strong", {}, "Some saves may be missing from this view. "),
+            "Reload the page. If this message stays, check with the others which version they see before you edit.")));
       }
       for (const w of d.limits || []) notes.push(el("div", { class: "doc-banner warn", role: "status" }, w));
       if (d.remote?.shown && v.id !== t.head.id) {
@@ -3594,6 +3636,7 @@ function buildDocView(s, { mainParts, railSet }) {
       if (content?.deleted) notes.push(el("div", { class: "doc-banner warn" }, "This tab is deleted."));
       const body = content
         ? docMarkdown(s, content.md, canWrite && v.id === t.head.id ? (md, note, cb) => busy(async () => {
+          const k = [...page.querySelectorAll(".doc-md input[type=checkbox]")].indexOf(cb);
           cb.disabled = true;
           const before = t.content.md;
           const r = await writeTab(doc, t, { md }, note);
@@ -3605,9 +3648,18 @@ function buildDocView(s, { mainParts, railSet }) {
             if (now?.head.id !== r.id) say("Someone saved this tab after your tick, so it was not undone. Untick the box instead.");
             else await writeTab(doc, now, { md: before }, `Undo: ${note}`);
             ui.render();
+            (page.querySelectorAll(".doc-md input[type=checkbox]")[k] || page).focus();
           }));
           ui.render();
+          const boxes = page.querySelectorAll(".doc-md input[type=checkbox]");
+          if (boxes[k]) boxes[k].focus();
+          else {
+            // The new version is still loading: focus the box once it shows.
+            d.wantBox = k;
+            page.focus({ preventScroll: true });
+          }
         }) : null)
+        : docLoading(s, v) ? el("p", { class: "muted", role: "status" }, "Loading this version…")
         : el("p", { class: "muted" }, "This version's content is not in this browser: it left the relay before this browser got it. Who saved it and when is in the history.");
       page.replaceChildren(head, ...notes, body, el("p", { class: "doc-untrusted muted" }, DOC_UNTRUSTED));
       if (content && v.id === t.head.id && !d.remote) {
@@ -3630,6 +3682,7 @@ function buildDocView(s, { mainParts, railSet }) {
       }
       d.model = docModel(s);
       ui.render();
+      refocus("[role=tab][aria-selected=true]");
     }),
     startEdit: (t) => {
       if (!d.drafts.has(t.id)) d.drafts.set(t.id, { md: t.content?.md ?? "", base: t.head.id, note: "" });
@@ -3649,7 +3702,8 @@ function buildDocView(s, { mainParts, railSet }) {
       const merge = el("div", {});
       const size = el("span", { class: "size mono" });
       const noteIn = el("input", { id: "doc-note", value: dr.note, placeholder: "What changed? Shown in history and to agents" });
-      const save = el("button", { type: "button", class: "primary" });
+      const save = el("button", { type: "button", class: "primary", "aria-describedby": "doc-save-why" });
+      const why = el("span", { class: "why", id: "doc-save-why" });
       const editor = el("div", { class: `editor${d.single ? " single" : ""}${d.previewing ? " previewing" : ""}` }, ta, pv);
       const preview = () => pv.replaceChildren(docMarkdown(s, dr.md, null));
       ta.addEventListener("input", () => {
@@ -3678,36 +3732,56 @@ function buildDocView(s, { mainParts, railSet }) {
         size.classList.toggle("over", bytes > DOC_MAX_MD);
         save.textContent = t ? `Save as v${(now || t).chain.versions.length + 1}` : "Create tab";
         save.disabled = stale || bytes > DOC_MAX_MD || !!s.closed;
-        if (stale) {
+        why.textContent = stale ? "Paused: someone saved a newer version (see above)" : "";
+        if (stale && banner.dataset.head !== now.head.id) {
+          // Rebuilt only when another version arrives, so it is announced once.
+          banner.dataset.head = now.head.id;
           const newer = now.chain.versions.slice(now.chain.versions.findIndex((x) => x.id === dr.base) + 1);
-          banner.replaceChildren(el("div", { class: "doc-banner warn", role: "alert" },
-            el("div", {}, el("strong", {}, `${[...new Set(newer.map((x) => author(x).name))].join(", ")} saved ${now.head.stamp} after your draft started`),
-              el("p", {}, `Your draft is based on ${base?.stamp ?? "an older version"}. Save is off until you merge, so their change can't be lost.`),
+          const names = [...new Set(newer.map((x) => author(x).name))].join(", ");
+          banner.replaceChildren(el("div", { class: "doc-banner warn", role: "alert", id: "doc-stale" },
+            el("div", {}, el("strong", {}, `${names} saved a newer version of this tab ${docAgo(now.head.created_at_ms)}, while you were editing.`),
+              el("p", {}, `Saving is paused so their change isn't lost. Your draft started from ${base ? `the version saved ${docAgo(base.created_at_ms)}` : "an older version"}.`),
               el("div", { class: "row" },
+                el("button", { type: "button", class: "small", "aria-pressed": String(!!d.theirs), onclick: (ev) => {
+                  d.theirs = !d.theirs;
+                  ev.currentTarget.setAttribute("aria-pressed", String(d.theirs));
+                  refresh();
+                } }, "See their change"),
                 el("button", { type: "button", class: "primary small", disabled: !now.content,
                   title: now.content ? "" : "Their version is still loading", onclick: () => {
                   if (!now.content) return;
                   d.merging = { mine: dr.md, from: dr.base };
+                  d.theirs = false;
                   dr.md = now.content?.md ?? "";
                   dr.base = now.head.id;
                   d.drafts.save();
                   ui.render();
                   page.querySelector("textarea")?.focus();
-                } }, `Merge into ${now.head.stamp}`),
+                } }, "Start from their version"),
                 el("button", { type: "button", class: "small", onclick: () => {
-                  d.theirs = !d.theirs;
-                  refresh();
-                } }, "See their change"),
+                  if (!confirm(`Save your draft over ${names}'s version? Theirs stays in the tab's history.`)) return;
+                  dr.base = now.head.id;
+                  d.merging = null;
+                  d.theirs = false;
+                  if (!dr.note.trim()) dr.note = `Kept my version over ${now.head.stamp}`;
+                  d.drafts.save();
+                  ui.render();
+                  page.querySelector("textarea")?.focus();
+                } }, "Keep mine instead"),
                 el("button", { type: "button", class: "ghost small", onclick: () => {
                   if (!confirm("Discard your draft? The tab stays as they saved it.")) return;
                   d.drafts.delete(key);
                   d.mode = "read";
                   ui.render();
+                  refocus("[data-focus=edit]");
                 } }, "Discard my draft")))));
-        } else banner.replaceChildren();
+        } else if (!stale) {
+          delete banner.dataset.head;
+          banner.replaceChildren();
+        }
         const mergeFrom = d.merging && t?.chain.versions.find((x) => x.id === d.merging.from);
         merge.replaceChildren(...(d.merging && mergeFrom ? [
-          el("p", { class: "caption" }, "The editor now holds ", el("strong", {}, now?.head.stamp ?? ""), ". Your edits, to copy across:"),
+          el("p", { class: "caption" }, el("strong", {}, "The editor now shows their version. "), "Your changes are listed below: add back the ones you still want, then save."),
           docDiff(docContent(s, mergeFrom)?.md ?? "", d.merging.mine),
           el("details", {}, el("summary", { class: "caption" }, "Your whole draft"), el("pre", { class: "mine" }, d.merging.mine))]
           : d.theirs && stale && base ? [el("p", { class: "caption" }, `Their change, ${base.stamp} → ${now.head.stamp}`), docDiff(docContent(s, base)?.md ?? "", now.content?.md ?? "")] : []));
@@ -3728,6 +3802,7 @@ function buildDocView(s, { mainParts, railSet }) {
         d.mode = "read";
         announce(`Saved ${t ? tabName(t) : dr.name} ${r.stamp ?? ""}`);
         ui.render();
+        refocus("[data-focus=edit]");
       }));
       const cancel = el("button", { type: "button", class: "ghost" }, "Cancel");
       cancel.addEventListener("click", () => {
@@ -3738,9 +3813,10 @@ function buildDocView(s, { mainParts, railSet }) {
         d.mode = "read";
         if (newId) d.tab = null;
         ui.render();
+        refocus("[data-focus=edit]");
       });
       const layout = (mode) => el("button", { type: "button", "aria-pressed": String(mode === "single" ? !!d.single : mode === "split" ? !d.single : !!d.previewing),
-        class: mode === "preview" ? "narrow-only" : "", onclick: () => {
+        class: mode === "preview" ? "narrow-only" : "wide-only", onclick: () => {
           if (mode === "preview") d.previewing = !d.previewing;
           else d.single = mode === "single";
           ui.render();
@@ -3752,13 +3828,31 @@ function buildDocView(s, { mainParts, railSet }) {
         el("div", { class: "edbar" }, el("div", { class: "seg", role: "group", "aria-label": "Editor layout" }, layout("split"), layout("single"), layout("preview")),
           el("span", { class: "hint mono" }, "Markdown · the whole tab is saved as one version · ⌘/Ctrl+Enter saves")),
         merge, editor,
-        el("div", { class: "savebar" }, el("label", { for: "doc-note" }, "Note"), noteIn, size, cancel, save));
+        el("div", { class: "savebar" }, el("label", { for: "doc-note" }, "Note"), noteIn, size, why, cancel, save),
+        t ? null : el("p", { class: "caption" }, "This new tab is not saved until you click Create tab, and is not kept if you reload."));
       preview();
       refresh();
       ui.refreshEdit = refresh;
       ui.side(doc, t);
     },
     refreshEdit: () => {},
+    // Re-render for a change someone else made, keeping focus on the same
+    // control (a task box, a tab, the Edit button) and the scroll position.
+    rerender: () => {
+      const a = document.activeElement;
+      const inPane = a && pane.contains(a);
+      const boxes = () => [...page.querySelectorAll(".doc-md input[type=checkbox]")];
+      const box = inPane ? boxes().indexOf(a) : -1;
+      const key = inPane && (a.dataset.focus ? `[data-focus=${a.dataset.focus}]` : a.dataset.tab ? `[data-tab="${CSS.escape(a.dataset.tab)}"]` : null);
+      const y = window.scrollY;
+      ui.render();
+      window.scrollTo({ top: y });
+      if (!inPane) return;
+      const wanted = d.wantBox != null ? boxes()[d.wantBox] : null;
+      if (wanted) d.wantBox = null;
+      const back = wanted || (box >= 0 ? boxes()[box] : key ? pane.querySelector(key) : null);
+      (back || page).focus({ preventScroll: true });
+    },
     history: (doc, t) => {
       const vs = t.chain.versions;
       const to = vs[d.hist.to];
@@ -3775,6 +3869,7 @@ function buildDocView(s, { mainParts, railSet }) {
         el("button", { type: "button", class: "ghost small", onclick: () => {
           d.mode = "read";
           ui.render();
+          refocus("[data-focus=edit]");
         } }, "Back to current"),
         canWrite && toC && to.id !== cur.id ? el("button", { type: "button", class: "small", onclick: () => busy(async () => {
           if (!confirm(`Restore ${to.stamp} as v${vs.length + 1}? This replaces the current text (${cur.stamp} by ${author(cur).name}) for everyone. The current text stays in history.`)) return;
@@ -3808,6 +3903,7 @@ function buildDocView(s, { mainParts, railSet }) {
             d.mode = "history";
             d.hist = { from: i - 1, to: i };
             ui.render();
+            refocus();
           } }, avatar(v), el("span", { class: "hn" }, c ? c.note || (i === 0 ? "Created" : "Saved") : "content no longer available",
             el("span", { class: "hv" }, author(v).name)), el("span", { class: "hv mono" }, v.stamp, el("br"), docAgo(v.created_at_ms))));
         }))));
@@ -3816,12 +3912,13 @@ function buildDocView(s, { mainParts, railSet }) {
       if (deleted.length) {
         sections.push(el("section", {}, el("h2", {}, "Deleted tabs"), el("ul", { class: "hist" }, deleted.map((x) => el("li", { class: "deleted-row" },
           el("span", {}, el("strong", {}, tabName(x)), el("span", { class: "hv" }, ` deleted by ${author(x.head).name} · ${x.head.stamp}`)),
-          canWrite ? el("button", { type: "button", class: "small", onclick: () => busy(async () => {
+          canWrite ? el("button", { type: "button", class: "small", "aria-label": `Restore tab ${tabName(x)}`, onclick: () => busy(async () => {
             const r = await writeTab(doc, x, { deleted: false }, `Restored tab (deleted by ${author(x.head).name})`);
             if (r?.stale) return say("Someone changed this tab a moment ago. Try again.");
             d.tab = x.id;
             d.mode = "read";
             ui.render();
+            refocus("[role=tab][aria-selected=true]");
           }) }, "Restore") : null)))));
       }
       const all = doc.tabs.flatMap((x) => x.chain.versions.map((v) => [v, x])).sort((a, b) => b[0].seq - a[0].seq);
@@ -3841,11 +3938,12 @@ function buildDocView(s, { mainParts, railSet }) {
             const i = x.chain.versions.findIndex((y) => y.id === v.id);
             d.hist = { from: i - 1, to: i };
             ui.render();
+            refocus();
           } }, v.stamp))));
       }))));
       const saves = [...s.items.values()].filter((it) => it.kind === "doc").length;
       sections.push(el("section", {}, el("h2", {}, "Keeping this doc"),
-        el("p", { class: "muted" }, `${saves} doc saves in this session. The doc lives in the session: when the session ends or the relay purges it after days without activity, the doc goes with it. Export keeps a copy.`)));
+        el("p", { class: "muted" }, `${saves} doc saves in this session. The doc is deleted with the session: when it ends, or after ${d.idle ?? "a while"} with nobody connected. Export keeps a copy.`)));
       side.replaceChildren(...sections);
     },
   };
@@ -3855,15 +3953,30 @@ function buildDocView(s, { mainParts, railSet }) {
 }
 
 // A toast with an Undo button, for one-click writes such as ticking a task.
+// It stays while the pointer or focus is on it, and Escape closes it.
 function toastUndo(text, undo) {
   document.getElementById("doc-toast")?.remove();
+  let timer;
+  const close = () => {
+    clearTimeout(timer);
+    t.remove();
+  };
+  const arm = () => {
+    clearTimeout(timer);
+    timer = setTimeout(close, 12000);
+  };
   const t = el("div", { class: "doc-toast", id: "doc-toast", role: "status" }, el("span", {}, text),
     el("button", { type: "button", class: "linkish", onclick: () => {
-      t.remove();
+      close();
       undo();
     } }, "Undo"));
+  t.addEventListener("mouseenter", () => clearTimeout(timer));
+  t.addEventListener("mouseleave", arm);
+  t.addEventListener("focusin", () => clearTimeout(timer));
+  t.addEventListener("focusout", arm);
+  t.addEventListener("keydown", (ev) => ev.key === "Escape" && close());
   document.body.append(t);
-  setTimeout(() => t.remove(), 6000);
+  arm();
 }
 
 // ---------- runner console ----------

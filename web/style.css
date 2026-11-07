@@ -810,7 +810,7 @@ body.landing .top-right { display: none; }
 .doc-tabs::-webkit-scrollbar { display: none; }
 .doc-tab { position: relative; flex: none; background: transparent; border: 1px solid transparent; border-bottom: 0; border-radius: 8px 8px 0 0; padding: 7px 14px 9px; font-size: 14px; color: var(--muted); display: inline-flex; align-items: center; gap: 7px; min-height: 40px; }
 .doc-tab:hover { color: var(--text); background: var(--panel); }
-.doc-tab[aria-selected=true] { color: var(--text); background: var(--bg); border-color: var(--line); margin-bottom: -1px; padding-bottom: 10px; }
+.doc-tab[aria-selected=true] { color: var(--text); font-weight: 500; background: var(--bg); border-color: var(--line); margin-bottom: -1px; padding-bottom: 10px; }
 .doc-tab[aria-selected=true]::before { content: ""; position: absolute; left: 10px; right: 10px; top: -1px; height: 2px; background: var(--accent); border-radius: 2px; }
 .doc-tab .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
 .doc-tab .draft { font: 11px var(--mono); color: var(--link); border: 1px solid var(--info-line); border-radius: 4px; padding: 0 4px; }
@@ -838,6 +838,9 @@ body.landing .top-right { display: none; }
 .tabmenu .menu button { background: transparent; border: 0; border-radius: 7px; padding: 8px 10px; text-align: left; font-size: 13px; min-height: 36px; justify-content: flex-start; }
 .tabmenu .menu button:hover { background: var(--panel); }
 .tabmenu .menu .danger { color: var(--bad); }
+.tabmenu .menu .sep { border-top: 1px solid var(--line); margin: 4px 6px; }
+.tabmenu .menu .grp { font: 500 11px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); padding: 6px 10px 2px; }
+.tabmenu .menu button:disabled { opacity: .45; cursor: default; }
 .doc-banner { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; border-radius: 10px; padding: 10px 14px; margin-bottom: 16px; font-size: 14px; }
 .doc-banner.info { background: var(--info-bg); border: 1px solid var(--info-line); }
 .doc-banner.warn { background: var(--accent-bg); border: 1px solid var(--accent-line); }
@@ -857,12 +860,15 @@ body.landing .top-right { display: none; }
 .docv .seg button { background: transparent; border: 0; border-radius: 0; padding: 0 10px; font-size: 12px; color: var(--muted); min-height: 30px; }
 .docv .seg button[aria-pressed=true] { background: var(--raised); color: var(--text); }
 .docv .seg .narrow-only { display: none; }
-.docv .editor { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); border: 1px solid var(--line-2); border-radius: 10px; overflow: hidden; min-height: 420px; }
+.docv .editor { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); border: 1px solid var(--line-3); border-radius: 10px; overflow: hidden; min-height: 420px; }
+/* The textarea draws no outline of its own: the editor frame shows focus. */
+.docv .editor:focus-within { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .docv .editor.single { grid-template-columns: minmax(0, 1fr); }
 .docv .editor textarea { background: var(--code-bg, #0b0d0f); border: 0; border-radius: 0; resize: vertical; padding: 16px; font: 13.5px/1.6 var(--mono); color: var(--text); outline: none; min-height: 420px; width: 100%; }
 .docv .editor .pv { padding: 16px 18px; border-left: 1px solid var(--line); overflow-y: auto; max-height: 70vh; min-width: 0; }
 .docv .editor.single .pv { display: none; }
-.docv .savebar { position: sticky; bottom: 0; z-index: 5; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 12px 0 calc(12px + env(safe-area-inset-bottom, 0px)); background: linear-gradient(transparent, var(--bg) 30%); margin-top: 6px; }
+.docv .savebar { position: sticky; bottom: 0; z-index: 5; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 0 calc(10px + env(safe-area-inset-bottom, 0px)); background: var(--bg); border-top: 1px solid var(--line); margin-top: 6px; }
+.docv .savebar .why { font-size: 12px; color: var(--accent); }
 .docv .savebar label { font-size: 12px; color: var(--muted); }
 .docv .savebar input { flex: 1 1 220px; min-width: 0; }
 .docv .savebar .size { font-size: 12px; color: var(--muted); }
@@ -872,8 +878,8 @@ body.landing .top-right { display: none; }
 .docv .mine { white-space: pre-wrap; font: 12.5px/1.55 var(--mono); color: var(--soft); max-height: 260px; overflow: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
 .docv .diff { font: 13px/1.6 var(--mono); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; margin: 4px 0 12px; }
 .docv .diff div { padding: 0 12px; white-space: pre-wrap; }
-.docv .diff .add { background: #16261c; color: var(--ok); }
-.docv .diff .del { background: #2a1717; color: var(--bad); }
+.docv .diff .add { background: var(--ok-bg); color: var(--ok); }
+.docv .diff .del { background: var(--bad-bg); color: var(--bad); }
 .docv .diff .ctx { color: var(--muted); }
 .doc-side .hist li button { width: 100%; text-align: left; background: transparent; border: 0; border-radius: 8px; padding: 7px 8px; display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 9px; align-items: start; min-height: 0; font-size: 12.5px; }
 .doc-side .hist li button:hover { background: var(--raised); }
@@ -896,6 +902,8 @@ body.landing .top-right { display: none; }
 }
 @container (max-width: 640px) {
   .docv .seg .narrow-only { display: inline-block; }
+  /* One column either way: Write or Preview is the only choice. */
+  .docv .seg .wide-only { display: none; }
   .docv .editor, .docv .editor.single { grid-template-columns: minmax(0, 1fr); }
   .docv .editor .pv { display: none; border-left: 0; }
   .docv .editor.previewing textarea { display: none; }
@@ -906,7 +914,15 @@ body.landing .top-right { display: none; }
   .docv .docbar, .doc-tabrow { padding-left: 16px; padding-right: 16px; }
   .doc-page { padding: 16px 16px 140px; }
   .docv .edbar .hint { display: none; }
+  /* Note on its own row, then the size and the buttons. */
+  .docv .savebar input { flex-basis: 100%; }
+  .docv .savebar label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  .docv .savebar .size { margin-right: auto; }
 }
 @media (pointer: coarse) {
-  .doc-tab, .addtab, .docv .seg button, .doc-side .hist li button { min-height: 44px; }
+  .doc-tab, .addtab, .docv .seg button, .doc-side .hist li button,
+  .docv button, .docv summary, .tabmenu .menu button { min-height: 44px; }
+  .docv .linkish { min-height: 32px; padding: 6px 2px; }
+  .doc-md input[type=checkbox] { width: 22px; height: 22px; vertical-align: -5px; }
+  .doc-toast button { min-height: 44px; }
 }
