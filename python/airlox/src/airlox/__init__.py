@@ -14,6 +14,7 @@
 
 from ._core import AirloxError, DecryptError, PolicyError, SignatureError, ValidationError
 
+from .docs import Doc, DocTab, DocVersion, StaleBase
 from .execute import (
     Chunk,
     Job,
@@ -33,6 +34,9 @@ __all__ = [
     "AirloxError",
     "Chunk",
     "DecryptError",
+    "Doc",
+    "DocTab",
+    "DocVersion",
     "Item",
     "Job",
     "JobTimeout",
@@ -47,6 +51,7 @@ __all__ = [
     "RunnerFailed",
     "Session",
     "SignatureError",
+    "StaleBase",
     "TransferCode",
     "Tree",
     "TreeRefused",
