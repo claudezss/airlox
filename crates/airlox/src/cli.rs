@@ -73,7 +73,7 @@ impl Conn {
         self.on.as_deref().and_then(|on| crate::machine::split_on(on).1)
     }
 
-    async fn join(&self) -> Result<Session> {
+    pub(crate) async fn join(&self) -> Result<Session> {
         let root = self.cache_root();
         let me = Profile::new(&self.display_name, self.description.as_deref());
         let mut s = Session::join(&client::http()?, &self.invite_link()?, &me, &root).await?;
@@ -220,7 +220,7 @@ pub struct CreateArgs {
     /// [default: 1h].
     #[arg(long, value_parser = parse_lifetime)]
     pub ttl: Option<Lifetime>,
-    /// Content types allowed, comma-separated (text, py, md, zip, image).
+    /// Content types allowed, comma-separated (text, py, md, zip, image, doc).
     #[arg(long, value_delimiter = ',', default_values_t = DEFAULT_TYPES.iter().map(|s| s.to_string()))]
     pub types: Vec<String>,
     /// Largest item, in MB (1 MB = 1024 × 1024 bytes) [default: the largest
@@ -1538,7 +1538,7 @@ pub async fn job_ls(a: JobLsArgs) -> Result<()> {
 }
 
 /// "41 s", "12 min", "3 h", "2 d" since `ms`.
-fn human_age(ms: u64) -> String {
+pub(crate) fn human_age(ms: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1753,6 +1753,20 @@ fn item_line(s: &Session, i: &Item) -> String {
                 format!("event {}", clean_line(i.meta.as_ref().unwrap()["event"].as_str().unwrap_or("?")))
             }
             "progress" => progress_line(i.meta.as_ref().unwrap()),
+            "doc" => {
+                let m = i.meta.as_ref().unwrap();
+                let what = match m["type"].as_str() {
+                    Some("doc_root") => format!("created doc {:?}", m["title"].as_str().unwrap_or("?")),
+                    Some("doc_meta") => format!("doc title/order: {:?}", m["title"].as_str().unwrap_or("?")),
+                    _ => format!("saved tab {:?}", m["name"].as_str().unwrap_or("?")),
+                };
+                let note = m["note"]
+                    .as_str()
+                    .filter(|n| !n.is_empty())
+                    .map(|n| format!(" — {n}"))
+                    .unwrap_or_default();
+                clean_line(&format!("{what}{note} (airlox doc show)"))
+            }
             k => clean_line(k),
         },
         Status::Evicted => format!("{} (left the relay before it was fetched)", clean_line(&i.kind)),

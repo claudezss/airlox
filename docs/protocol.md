@@ -296,8 +296,8 @@ Every message, file, job, result and event is an item: a plaintext
     "id": "<22-char base64url of 16 random bytes>",
     "session_id": "…",
     "author": "<participant public key>",
-    "kind": "text|file|job|result|event|progress",
-    "subkind": null | "py|md|zip|image|sh",
+    "kind": "text|file|job|result|event|progress|doc",
+    "subkind": null | "py|md|zip|image|sh|root|meta|tab",
     "size": 31,
     "created_at_ms": 0,
     "refs": [{"id": "<item id>", "blob_sha256": "<b64 SHA-256 of that item's blob>"}, …]
@@ -313,7 +313,9 @@ sig      = Ed25519(author, "item", canonical(header) || SHA-256(blob))
 ```
 
 - `subkind` rules: `text`, `result`, `event`, `progress` → `null`; `file` → one of
-  `py|md|zip|image`; `job` → `py` (a `python` job) or `sh` (a `shell` job).
+  `py|md|zip|image`; `job` → `py` (a `python` job) or `sh` (a `shell` job);
+  `doc` → `root` (no refs), `meta` (exactly 2 refs) or `tab` (1 or 2 refs),
+  see **Docs** in §7.
   The relay learns the kind of a job, and nothing else about it.
 - `size` is the plaintext payload length; `len(blob) == size + 28`.
 - `id` must decode (strict base64url) to exactly 16 bytes.
@@ -347,6 +349,37 @@ meta. Only `file` carries a non-empty `body`.
 | `result` | `job` (item reference), `exit_code` (nullable), `status`, `reason` (nullable), `wall_ms`, `peak_mem_mb`, `stdout`, `stderr`, `stdout_truncated`, `stderr_truncated`, `out_files` [`{name, size, item}`] where `item` is an item reference, `code_sha256`, `input_sha256` (lowercase hex), and optionally `env` (absent, never `null`, when not reported) |
 | `event` | tagged by `event`: `runner_approve {participant_pub}`, `runner_reject {participant_pub, reason}`, `job_cancel {job}` (item reference), `session_close` |
 | `progress` | `job` (item reference), `elapsed_ms`, `tail` (nullable), `tail_truncated`, and, for an output chunk, `stream`, `offset`, `data` and optionally `truncated` (`true`) |
+| `doc_root`, `doc_meta` | `v` (1), `title`, `order` (tab ids) |
+| `doc_tab` | `v` (1), `name`, `md`, `deleted`, `note`, and optionally `to` (as for `text`) |
+
+**Docs.** A shared doc is a set of `doc` items: a title, ordered tabs, and
+for each tab a chain of whole-text versions (design:
+[docs.md](design/docs.md) §0). Its `root` item (refs `[]`, payload
+`doc_root`) creates it; the root's id is the doc id, and the root is the
+first version of the doc's *meta* chain. A `meta` item (refs `[root,
+base]`, payload `doc_meta`) is the next version of the meta chain: a new
+title or tab order. A `tab` item with refs `[root]` creates a tab, whose id
+is that item's id; one with refs `[root, base]` is the next version of the
+tab whose current version is `base`. Every reference is a full item
+reference, so `base` names exactly one version.
+
+Which version of a chain is current is decided from headers alone, in relay
+order (`seq`): an item applies when its author is an owner or a sender, its
+`refs[0]` is a doc's root, and its `base` is the current head of a chain of
+the same subkind in that doc (a new tab needs fewer than 64 tabs). The relay
+refuses any other `doc` item (`409 stale_base` with the current head, `404
+unknown_doc`, `409 unknown_base`, `413 too_many_tabs`), and a client that
+replays a log ignores one. So the first save from a given version wins, and
+the relay and every client agree on every chain, including clients that
+never got older versions' blobs (the `item` event carries each blob's hash,
+§12). Content never changes which version applies: a version whose payload
+does not decode or check shows as unreadable. A payload's `v` is 1; `title`
+is 1 to 200 characters and `name` 1 to 64, both under the display-name
+rules of §5; `note` is empty or up to 512 such characters; `md` is at most
+256 KiB of UTF-8 without NUL; `order` lists at most 64 distinct item ids. A
+delete is a version with `deleted: true` that keeps `md`. Version `n` of a
+chain (counting from 1) has the *stamp* `v<n>·<first 8 hex digits of its
+blob's SHA-256>`, for display; the wire always carries full references.
 
 A `progress` item is a runner's signed note that a job is still running:
 the time since it started and, if the job named a `progress_file` (a
@@ -489,7 +522,7 @@ Never from relay metadata or caller input.
 | role | may post kinds |
 |---|---|
 | owner | all |
-| sender | text, file, job, event |
+| sender | text, file, job, event, doc |
 | runner | result, file, progress |
 | observer | none |
 
@@ -497,7 +530,8 @@ Plus: runners may post only in execute mode; `size ≤ max_item_bytes`;
 `created_at_ms` within the session lifetime; `text` needs `text` allowed;
 `file` needs its subkind allowed; a `job` needs execute mode and its kind in
 the manifest's `kinds` (a `py` job also needs `py` allowed); `result` and
-`progress` need execute mode.
+`progress` need execute mode; `doc` needs `doc` allowed and follows the
+chain rules of §7.
 
 **Client and runner** (after decryption): payload type equals header kind;
 file rules from §7; a text's `to`, when present, holds 1 to 64 distinct keys;
@@ -682,6 +716,7 @@ sends nothing for 30 seconds is answered with `408`.
 | `GET /v1/sessions/{id}/items/{item}/blob` | bearer | none | `200` ciphertext, or `410 evicted` |
 | `POST /v1/sessions/{id}/items/{item}/ack` | bearer, recipient | none | `204` |
 | `GET /v1/sessions/{id}/delivery` | bearer | none | `200 {"items": {id: {"seq", "delivered": [participant_pub…], "waiting": [participant_pub…]}}}` for the caller's own most recent 500 items: who acked each one, and which live recipients the relay still holds it for. Ack means stored, not read |
+| `GET /v1/sessions/{id}/usage` | bearer | none | `200 {"items", "max_items", "log_bytes", "max_log_bytes", "doc_items", "max_doc_items", "doc_bytes", "max_doc_bytes", "idle_ttl_ms"}`: how much of the session's limits is used (clients warn at 80%), and how long it may sit with no stream open and nothing done before the relay deletes it |
 | `POST /v1/sessions/{id}/items/{item}/want` | bearer, never received it | none | `202 {"open": true}`; `409 present` if the blob is on the relay |
 | `PUT /v1/sessions/{id}/items/{item}/blob` | bearer, while wanted | ciphertext | `204`; `409 present` or `409 not_wanted` |
 | `POST /v1/sessions/{id}/roles/{role}/revoke` | bearer, owner | none | `204`; `role` is `sender`, `observer` or `runner` |
@@ -725,7 +760,7 @@ public event carries that line's `seq`. Events are `{"seq", "kind", "data"}`:
 | kind | data |
 |---|---|
 | `participant` | `{participant_pub, role, display_name, kind, runner, signed_join}` |
-| `item` | `{envelope, blob_len, blob_present}` |
+| `item` | `{envelope, blob_len, blob_present, blob_sha256}`: `blob_sha256` (base64url) is the hash the author's signature covers; clients check it against the signature before using it, and may then reference the item exactly without its blob |
 | `left` | `{participant_pub}`: no longer a recipient; its token is revoked |
 | `evicted` | `{item}`: the blob left the relay; the envelope stays |
 | `want` | `{item, by}`: participant `by` asks holders to upload the evicted blob again |
@@ -754,7 +789,11 @@ acked and a short grace period has passed, or when the hold limit expires,
 whichever comes first. A recipient that leaves stops counting. The owner's
 signed `event` items up to 16 KiB (runner approvals and rejections, close)
 are never evicted, so a participant that joins later can always verify which
-runners the owner approved. After that
+runners the owner approved. `doc` items are kept while they are among the
+newest versions of their chain (5 by default) or are the newest version the
+owner wrote; a version pushed out of that set is held like any blob. Any
+owner, sender or observer may fetch a kept doc blob, whenever they joined;
+runners are never recipients of `doc` items and are refused their blobs. After that
 `GET …/blob` is `410 evicted`, and clients show the item as delivered but
 unavailable until it is re-seeded. `progress` items are the exception in
 the other direction: display data that leaves no trace. They do not count

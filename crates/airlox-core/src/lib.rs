@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod cert;
+pub mod doc;
 pub mod encoding;
 mod error;
 pub mod invite;

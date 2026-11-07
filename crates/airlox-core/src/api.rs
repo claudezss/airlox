@@ -167,6 +167,16 @@ pub fn item_ref(envelope_json: &str, blob: &[u8]) -> Result<String> {
     json(&ItemRef::to(&s))
 }
 
+/// Check that `blob_sha256` (base64url) is the hash of the blob the
+/// envelope's author signed, without the blob: what a relay says about an
+/// item it no longer holds. Returns the item reference.
+pub fn item_ref_from_digest(envelope_json: &str, blob_sha256: &str) -> Result<String> {
+    let env: ItemEnvelope = crate::encoding::parse_canonical(envelope_json, "item envelope")?;
+    let digest = crate::encoding::b64d_32(blob_sha256)?;
+    env.verify_blob_digest(env.header.blob_len()?, &digest)?;
+    json(&ItemRef { id: env.header.id.clone(), blob_sha256: blob_sha256.to_string() })
+}
+
 pub fn verify_item(envelope_json: &str, blob: &[u8]) -> Result<()> {
     sealed(envelope_json, blob)?.verify()
 }
@@ -300,4 +310,67 @@ pub fn transfer_open(code: &str, sealed_box: &str) -> Result<String> {
     let invite = crate::transfer::Code::parse(code)?.open(sealed_box)?;
     Invite::parse(&invite)?;
     Ok(invite)
+}
+
+// ------------------------------------------------------------------ docs --
+
+/// One `doc` item as a client knows it, for [`doc_index`].
+#[derive(Deserialize)]
+struct DocEntry {
+    envelope: String,
+    blob_sha256: String,
+    /// Whether the author holds the owner role.
+    owner: bool,
+    seq: u64,
+}
+
+/// The session's docs from its `doc` items (`entries_json`: a JSON list of
+/// `{envelope, blob_sha256, owner, seq}`, in relay order, from owners and
+/// senders only). Returns `{docs: [{id, meta: chain, tabs: [chain]}],
+/// skipped: [item id]}`, each chain `{id, versions: [{id, blob_sha256,
+/// author, owner, seq, created_at_ms, stamp}]}` with tabs in creation order.
+/// Entries that do not apply are left out of `docs` and listed in `skipped`:
+/// the relay stores only items that apply, so any there mean this client's
+/// history may be incomplete.
+pub fn doc_index(entries_json: &str) -> Result<String> {
+    let entries: Vec<DocEntry> = serde_json::from_str(entries_json)?;
+    let mut ix = crate::doc::DocIndex::default();
+    for e in entries {
+        let Ok(env) = parse_canonical::<ItemEnvelope>(&e.envelope, "item envelope") else { continue };
+        if env.header.kind != crate::item::ItemKind::Doc {
+            continue;
+        }
+        let _ = ix.apply(&env.header, &e.blob_sha256, e.owner, e.seq);
+    }
+    let chain = |c: &crate::doc::Chain| {
+        serde_json::json!({
+            "id": c.id,
+            "versions": c.versions.iter().enumerate().map(|(i, v)| serde_json::json!({
+                "id": v.item.id, "blob_sha256": v.item.blob_sha256, "author": v.author.to_b64(),
+                "owner": v.owner, "seq": v.seq, "created_at_ms": v.created_at_ms, "stamp": c.stamp_at(i),
+            })).collect::<Vec<_>>(),
+        })
+    };
+    let docs: Vec<serde_json::Value> = ix
+        .docs()
+        .map(|d| serde_json::json!({"id": d.id(), "meta": chain(&d.meta), "tabs": d.tabs.iter().map(chain).collect::<Vec<_>>()}))
+        .collect();
+    json(&serde_json::json!({"docs": docs, "skipped": ix.skipped}))
+}
+
+/// Check a doc payload's meta (`doc_root`, `doc_meta` or `doc_tab` JSON)
+/// before sending it.
+pub fn doc_check(meta_json: &str) -> Result<()> {
+    match serde_json::from_str::<Meta>(meta_json)? {
+        Meta::DocRoot(d) | Meta::DocMeta(d) => crate::doc::check_info(&d),
+        Meta::DocTab(t) => crate::doc::check_tab(&t),
+        _ => Err(Error::invalid("doc", "not a doc payload")),
+    }
+}
+
+/// A line diff of two texts: a JSON list of `[" " | "-" | "+", line]`.
+pub fn line_diff(a: &str, b: &str) -> Result<String> {
+    let d: Vec<(String, &str)> =
+        crate::doc::line_diff(a, b).into_iter().map(|(k, l)| (k.to_string(), l)).collect();
+    json(&d)
 }

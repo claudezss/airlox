@@ -253,3 +253,27 @@ pub fn transfer_claim(code: &str) -> R<JsValue> {
 pub fn transfer_open(code: &str, sealed_box: &str) -> R<String> {
     api::transfer_open(code, sealed_box).map_err(err)
 }
+
+/// The `{id, blob_sha256}` reference of an item whose blob this client does
+/// not have, from the hash the relay gave: checked against the author's
+/// signature.
+#[wasm_bindgen(js_name = itemRefFromDigest)]
+pub fn item_ref_from_digest(envelope_json: &str, blob_sha256: &str) -> R<String> {
+    api::item_ref_from_digest(envelope_json, blob_sha256).map_err(err)
+}
+
+/// The session's doc chains from its `doc` items, in relay order.
+#[wasm_bindgen(js_name = docIndex)]
+pub fn doc_index(entries_json: &str) -> R<String> {
+    api::doc_index(entries_json).map_err(err)
+}
+
+#[wasm_bindgen(js_name = docCheck)]
+pub fn doc_check(meta_json: &str) -> R<()> {
+    api::doc_check(meta_json).map_err(err)
+}
+
+#[wasm_bindgen(js_name = lineDiff)]
+pub fn line_diff(a: &str, b: &str) -> R<String> {
+    api::line_diff(a, b).map_err(err)
+}

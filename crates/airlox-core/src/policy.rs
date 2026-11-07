@@ -40,7 +40,7 @@ pub fn role_may_post(role: Role, kind: ItemKind) -> bool {
     use ItemKind::*;
     match role {
         Role::Owner => true,
-        Role::Sender => matches!(kind, Text | File | Job | Event),
+        Role::Sender => matches!(kind, Text | File | Job | Event | Doc),
         Role::Runner => matches!(kind, Result | File | Progress),
         Role::Observer => false,
     }
@@ -85,6 +85,15 @@ pub fn check_header(m: &Manifest, author_role: Role, h: &ItemHeader) -> Result<(
         }
         ItemKind::Result | ItemKind::Progress => require_execute(m)?,
         ItemKind::Event => {}
+        ItemKind::Doc => {
+            require_type(m, ContentType::Doc)?;
+            if h.size > crate::doc::MAX_DOC_ITEM_BYTES {
+                return Err(Error::policy(format!(
+                    "doc items are at most {} KiB",
+                    crate::doc::MAX_DOC_ITEM_BYTES / 1024
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -132,6 +141,19 @@ pub fn check_payload(m: &Manifest, author_role: Role, h: &ItemHeader, p: &Payloa
         Meta::Result(r) => check_result(r),
         Meta::Event(e) => check_event(author_role, e),
         Meta::Progress(p) => check_progress(p),
+        Meta::DocRoot(d) | Meta::DocMeta(d) => {
+            let want = if matches!(p.meta, Meta::DocRoot(_)) { ContentType::Root } else { ContentType::Meta };
+            if h.subkind != Some(want) {
+                return Err(Error::policy("the doc payload does not match its header subkind"));
+            }
+            crate::doc::check_info(d)
+        }
+        Meta::DocTab(t) => {
+            if h.subkind != Some(ContentType::Tab) {
+                return Err(Error::policy("the doc payload does not match its header subkind"));
+            }
+            crate::doc::check_tab(t)
+        }
     }
 }
 
@@ -265,7 +287,12 @@ pub fn check_file(subkind: ContentType, name: &str, mime: &str, body: &[u8]) -> 
             };
             ext_ok && sniffed == Some(mime)
         }
-        ContentType::Text | ContentType::Sh => false,
+        ContentType::Text
+        | ContentType::Sh
+        | ContentType::Doc
+        | ContentType::Root
+        | ContentType::Meta
+        | ContentType::Tab => false,
     };
     if !ok {
         return Err(Error::policy(format!(

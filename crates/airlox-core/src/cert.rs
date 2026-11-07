@@ -208,7 +208,7 @@ fn selector(c: char) -> bool {
     matches!(c, '\u{034F}' | '\u{180B}'..='\u{180D}' | '\u{FE00}'..='\u{FE0F}')
 }
 
-fn check_display_text(what: &'static str, s: &str, max_chars: usize) -> Result<()> {
+pub(crate) fn check_display_text(what: &'static str, s: &str, max_chars: usize) -> Result<()> {
     let bad = |why: &str| Err(Error::invalid(what, format!("must be 1..={max_chars} characters: {why}")));
     if s.trim().is_empty() || s.chars().count() > max_chars {
         return bad("not empty, not only whitespace, not too long");

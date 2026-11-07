@@ -367,6 +367,34 @@ pub async fn delivery(
     Ok(Json(json!({"items": items})))
 }
 
+/// `GET /v1/sessions/:id/usage` — how much of the session's limits is used,
+/// so clients can warn before saves are refused, and how long the session
+/// may sit with nobody connected before the relay deletes it.
+pub async fn usage(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let s = session(&st, &id)?;
+    if auth(&s, &headers)?.1 == Role::Runner {
+        return Err(ApiError::forbidden("runners do not see the session's usage"));
+    }
+    let cfg = &st.store.cfg;
+    let g = s.lock();
+    Ok(Json(json!({
+        "items": g.history_items(),
+        "max_items": cfg.max_items,
+        "log_bytes": g.log_len(),
+        "max_log_bytes": cfg.max_log_bytes,
+        "doc_items": g.doc_items,
+        "max_doc_items": g.doc_limits.max_items,
+        "doc_bytes": g.doc_kept_bytes,
+        "max_doc_bytes": g.doc_limits.max_bytes,
+        // Deleted after this long with no stream open and nothing done.
+        "idle_ttl_ms": cfg.idle_ttl_for(s.signed.manifest.expires_at_ms),
+    })))
+}
+
 /// The most recent own items `delivery` reports on.
 const DELIVERY_ITEMS: usize = 500;
 
@@ -714,6 +742,56 @@ async fn receive_blob(
     }
 }
 
+/// Whether a `doc` item may be stored now: the session's doc limits, the
+/// author's rate, and the doc rules (its base must be the current head of
+/// its chain, so the first save wins). Runs before the upload, and again
+/// under the session lock right before the item is logged.
+pub(crate) fn doc_admit(g: &Inner, h: &ItemHeader, who: &str, owner: bool, now: u64) -> ApiResult<()> {
+    use airlox_core::doc::Reject;
+    let lim = g.doc_limits;
+    // A tenth of the saves, like a quarter of the bytes, is the owner's, so
+    // other writers cannot lock the owner out of the plan.
+    let save_cap = if owner { lim.max_items } else { lim.max_items - lim.max_items / 10 };
+    if g.doc_items >= save_cap {
+        return Err(ApiError::session_full(
+            "this session's doc save limit is reached; export the doc and continue it in a new session",
+        ));
+    }
+    let recent = g.doc_posts.get(who).map(|q| q.iter().filter(|t| now.saturating_sub(**t) < 60_000).count());
+    if recent.unwrap_or(0) >= lim.posts_per_minute {
+        return Err(ApiError::limit("too many doc saves this minute; wait a moment"));
+    }
+    let cap = if owner { lim.max_bytes } else { lim.max_bytes / 4 * 3 };
+    // A new version also pushes an older one out of the kept set: count only
+    // what the save adds.
+    let place = g.docs.place(h);
+    let freed = match &place {
+        Ok(p) => p.doc().map_or(0, |d| g.doc_bytes_released(d, p.chain(&h.id), owner)),
+        Err(_) => 0,
+    };
+    if (g.doc_kept_bytes + h.blob_len()?).saturating_sub(freed) > cap {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "doc_full",
+            "this session's docs are at their size limit",
+        ));
+    }
+    match place {
+        Ok(_) => Ok(()),
+        Err(Reject::Stale { chain, head, head_stamp }) => Err(ApiError::conflict_code(
+            "stale_base",
+            Reject::Stale { chain: chain.clone(), head: head.clone(), head_stamp: head_stamp.clone() }
+                .message(),
+        )
+        .with(json!({"chain": chain, "head": head, "head_stamp": head_stamp}))),
+        Err(e @ Reject::UnknownDoc) => Err(ApiError::new(StatusCode::NOT_FOUND, "unknown_doc", e.message())),
+        Err(e @ Reject::UnknownBase) => Err(ApiError::conflict_code("unknown_base", e.message())),
+        Err(e @ Reject::TooManyTabs) => {
+            Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_many_tabs", e.message()))
+        }
+    }
+}
+
 /// Move the blob into place and append the item to the log. `then` runs
 /// under the same session lock right after the item is recorded, so routing
 /// decisions and job state changes are atomic with it. Blocks on disk.
@@ -736,7 +814,22 @@ pub(crate) fn commit_upload<T>(
         if !g.is_live(who) {
             return Err(ApiError::unauthorized());
         }
-        let recipients: Vec<String> = g.active_participants().filter(|k| *k != who).cloned().collect();
+        let doc = env.header.kind == ItemKind::Doc;
+        if doc {
+            let owner = g.participants.get(who).is_some_and(|p| p.role == Role::Owner);
+            doc_admit(&g, &env.header, who, owner, now_ms())?;
+            let t = now_ms();
+            let q = g.doc_posts.entry(who.to_string()).or_default();
+            q.retain(|x| t.saturating_sub(*x) < 60_000);
+            q.push_back(t);
+        }
+        // Runners never receive docs.
+        let recipients: Vec<String> = g
+            .active_participants()
+            .filter(|k| *k != who)
+            .filter(|k| !doc || g.participants.get(*k).is_some_and(|p| p.role != Role::Runner))
+            .cloned()
+            .collect();
         g.pending.remove(&reservation.id);
         g.pending_bytes -= blob_len;
         // Applying the Item record charges the transfer and address usage for real.
@@ -798,6 +891,15 @@ pub async fn post_item(
     let up = receive_upload(&st, &s, &who, role, ip_hash, body, |h| {
         if h.kind == ItemKind::Job {
             return Err(ApiError::forbidden("submit jobs with POST /jobs"));
+        }
+        if h.kind == ItemKind::Doc {
+            // Fail fast, before the upload; checked again when it is stored.
+            // A retry of a post that was stored is a duplicate, not stale.
+            let g = s2.lock();
+            if g.items.contains_key(&h.id) {
+                return Err(ApiError::conflict_code("duplicate", "an item with this id already exists"));
+            }
+            doc_admit(&g, h, &who2, role == Role::Owner, now_ms())?;
         }
         if role == Role::Runner {
             // A runner posts only as an eligible runner, and a result only
@@ -866,10 +968,13 @@ pub async fn get_blob(
 ) -> ApiResult<Response> {
     item_path_ok(&item)?;
     let s = session(&st, &id)?;
-    auth(&s, &headers)?;
+    let (_, role) = auth(&s, &headers)?;
     let len = {
         let mut g = s.lock();
         let r = g.items.get(&item).ok_or_else(|| ApiError::not_found("no such item"))?;
+        if r.doc && role == Role::Runner {
+            return Err(ApiError::forbidden("runners do not receive docs"));
+        }
         if !r.blob_present {
             return Err(ApiError::gone("evicted", "delivered and removed from the relay"));
         }
@@ -952,6 +1057,9 @@ pub async fn want(
             return Err(ApiError::forbidden("this runner is not approved"));
         }
         let r = g.items.get(&item).ok_or_else(|| ApiError::not_found("no such item"))?;
+        if r.doc && role == Role::Runner {
+            return Err(ApiError::forbidden("runners do not receive docs"));
+        }
         if r.blob_present {
             return Err(ApiError::conflict_code("present", "the blob is on the relay; download it"));
         }

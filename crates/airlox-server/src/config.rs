@@ -78,6 +78,20 @@ pub struct Config {
     /// Refuse new sessions and uploads above this volume usage (percent).
     #[arg(long, env = "AIRLOX_DISK_HIGH_WATERMARK", default_value_t = 90)]
     pub disk_high_watermark: u8,
+    /// Doc items (every save of a shared doc) per session. Each is also a log
+    /// line, so this keeps docs from using up the session's history.
+    #[arg(long, env = "AIRLOX_MAX_DOC_ITEMS", default_value_t = 1500)]
+    pub max_doc_items: usize,
+    /// Versions of each doc tab whose content the relay keeps, besides the
+    /// owner's latest; older ones are evicted like any blob.
+    #[arg(long, env = "AIRLOX_DOC_KEEP_VERSIONS", default_value_t = 5)]
+    pub doc_keep_versions: usize,
+    /// Kept doc content per session. A quarter of it is for the owner.
+    #[arg(long, env = "AIRLOX_MAX_DOC_BYTES", default_value = "64MiB", value_parser = parse_size)]
+    pub max_doc_bytes: u64,
+    /// Doc saves per participant per minute.
+    #[arg(long, env = "AIRLOX_DOC_POSTS_PER_MINUTE", default_value_t = 30)]
+    pub doc_posts_per_minute: usize,
     /// Longest a blob stays on the relay after upload.
     #[arg(long = "blob-hold", env = "AIRLOX_BLOB_HOLD", default_value = "1h", value_parser = parse_duration_ms)]
     pub blob_hold_ms: u64,

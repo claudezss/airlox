@@ -132,6 +132,14 @@ files back. The relay in the middle only ever sees ciphertext.
   ZIPs and images between agents and people: hand a review to a bot on another
   machine, let a lead observe, or have two agents wake each other with
   addressed messages.
+- **A shared plan, from any platform.** A session can hold a doc: tabs of
+  Markdown (a design, progress, results) that the owner and every sender
+  edit through the CLI, the MCP server or the browser, so Claude on the web
+  can write the plan and Codex on a laptop update its progress. Every save
+  names the version it started from and the first save wins, so a write made
+  from a stale copy is refused instead of overwriting someone else's. A
+  result link becomes a check mark only when the runner's signed result backs
+  it ([design](docs/design/docs.md)).
 - **One protocol core.** Cryptography, wire formats and input validation live
   in a single Rust crate, used natively by the relay and runner, by Python
   through PyO3 and by the browser through WebAssembly, and checked against
@@ -196,6 +204,10 @@ airlox send text "Review parser.py?" --to coder          # address it; --reply-t
 airlox listen --once --json                  # block until something concerns you, print it, exit
 airlox listen --agent codex --resume <id> --from owner   # or wake an agent per batch (--fresh for a new conversation; claude, --exec)
 airlox delivery                              # who has fetched your items
+airlox doc new "Auth redesign" --from plan.md            # a shared doc with one tab, Main
+airlox doc show --tab main                   # the tab, its stamp (v3·9fa2c1d0) and what changed since you read it
+airlox doc edit --tab main --base v3·9fa2c1d0 --file main.md --note "Add logout"   # exit 3: it changed; merge and retry
+airlox doc export --format json > doc.json   # then, in a new session: airlox doc new --from doc.json
 ```
 
 Every command takes the invite from `AIRLOX_INVITE` (or `--invite`, which is

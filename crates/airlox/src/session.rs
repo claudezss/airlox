@@ -25,6 +25,9 @@ use crate::client::{self, is_transient, status_of, Relay, RelayError};
 use crate::sse::SseParser;
 use crate::view::write_atomic;
 
+mod docs;
+pub use docs::{DocWrite, StaleBase, INCOMPLETE};
+
 /// Largest believable gap between consecutive event sequence numbers a
 /// participant sees (gaps are only events meant for others, such as job
 /// routing). Small, so one forged event cannot hide the session's future.
@@ -34,7 +37,7 @@ const MAX_SEQ_JUMP: u64 = 10_000;
 const REASK: Duration = Duration::from_secs(5 * 60);
 
 /// Content types a new session allows unless told otherwise.
-pub const DEFAULT_TYPES: &[&str] = &["text", "py", "md", "zip", "image"];
+pub const DEFAULT_TYPES: &[&str] = &["text", "py", "md", "zip", "image", "doc"];
 
 /// `(subkind, mime)` for a file name the protocol can carry.
 pub fn file_type(name: &str) -> Option<(&'static str, &'static str)> {
@@ -164,6 +167,19 @@ impl Cache {
             json!({"seq": seq}).to_string().as_bytes(),
             0o600,
         )
+    }
+
+    /// The version of each doc chain this role last read (chain id → item
+    /// id): a local cursor for "changed since you last read".
+    fn docs_read(&self, role: &str) -> HashMap<String, String> {
+        fs::read(self.dir.join(format!("docs-read-{role}.json")))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_docs_read(&self, role: &str, read: &HashMap<String, String>) -> Result<()> {
+        write_atomic(&self.dir.join(format!("docs-read-{role}.json")), &serde_json::to_vec(read)?, 0o600)
     }
 
     fn load_manifest(&self) -> Option<String> {
@@ -351,7 +367,8 @@ fn hops(items: &[Item], index: &HashMap<String, usize>, web: &dyn Fn(&str) -> bo
             if web(&i.author) || run > 1000 {
                 break;
             }
-            if i.kind == "text" {
+            // Doc saves that wake someone are agents talking too.
+            if i.kind == "text" || (i.kind == "doc" && i.to().is_some()) {
                 run += 1;
             }
         }
@@ -791,6 +808,10 @@ pub struct Session {
     asked: HashSet<String>,
     /// Evicted items back on the relay, to fetch.
     reseeded: HashSet<String>,
+    /// Blob hashes the relay gave with item events, checked against the
+    /// author's signature: an item this client never fetched still has an
+    /// exact reference (which doc chains need).
+    digests: HashMap<String, String>,
     unacked: HashSet<String>,
     last_seq: Option<u64>,
     /// When this client last heard from the relay: a sync that went through,
@@ -931,6 +952,7 @@ impl Session {
             wanted: HashMap::new(),
             asked: HashSet::new(),
             reseeded: HashSet::new(),
+            digests: HashMap::new(),
             unacked: HashSet::new(),
             last_seq: None,
             synced_at_ms: None,
@@ -1104,6 +1126,34 @@ impl Session {
         Ok(self.relay.get_json("/delivery").await?["items"].take())
     }
 
+    /// How much of the session's limits is used (`GET /usage`).
+    pub async fn usage(&self) -> Result<Value> {
+        self.relay.get_json("/usage").await
+    }
+
+    /// Warnings for limits at 80% or more, for doc saves: the session's doc
+    /// save count, its history (items and log bytes) and kept doc bytes.
+    /// Empty when the relay does not report usage.
+    pub async fn doc_limit_warnings(&self) -> Vec<String> {
+        let Ok(u) = self.usage().await else { return vec![] };
+        let mut out = vec![];
+        let mut check = |used: &str, max: &str, what: &str| {
+            let (Some(n), Some(m)) = (u[used].as_u64(), u[max].as_u64()) else { return };
+            if m > 0 && n * 5 >= m * 4 {
+                out.push(format!(
+                    "{what} is {}% full ({n} of {m}); when it is full, saves are refused. \
+                     `airlox doc export --format json` and `airlox doc new --from` continue the doc in a new session.",
+                    n * 100 / m
+                ));
+            }
+        };
+        check("doc_items", "max_doc_items", "this session's doc save limit");
+        check("items", "max_items", "this session's item limit");
+        check("log_bytes", "max_log_bytes", "this session's history");
+        check("doc_bytes", "max_doc_bytes", "this session's doc storage");
+        out
+    }
+
     /// Send a file the protocol can carry, as a reply to item `reply_to` if
     /// given. Images are re-encoded first to strip metadata; ZIPs are
     /// checked. Returns the item reference.
@@ -1144,6 +1194,7 @@ impl Session {
             "text" => Some("text"),
             "file" => subkind,
             "job" => Some("py"),
+            "doc" => Some("doc"),
             _ => None,
         };
         let allowed: Vec<String> = serde_json::from_value(json!(self.manifest.allowed_types))?;
@@ -1997,6 +2048,16 @@ impl Session {
             }
             "item" => {
                 if let Some(env) = data["envelope"].as_str() {
+                    if let Some(sha) = data["blob_sha256"].as_str() {
+                        if api::item_ref_from_digest(env, sha).is_ok() {
+                            if let Some(id) = serde_json::from_str::<Value>(env)
+                                .ok()
+                                .and_then(|v| v["header"]["id"].as_str().map(String::from))
+                            {
+                                self.digests.insert(id, sha.to_string());
+                            }
+                        }
+                    }
                     out = self.receive(seq, env.to_string(), fetch).await?;
                 }
             }
@@ -2123,7 +2184,7 @@ impl Session {
             author_name: author.as_ref().map(|a| a.display_name.clone()),
             created_at_ms: h["created_at_ms"].as_u64().unwrap_or(0),
             refs: h["refs"].clone(),
-            item_ref: json!({"id": id, "blob_sha256": ""}),
+            item_ref: json!({"id": id, "blob_sha256": self.digests.get(&id).cloned().unwrap_or_default()}),
             meta: None,
             body: vec![],
             status: Status::Ok,
@@ -2320,6 +2381,13 @@ mod tests {
         items.push(progress);
         items.push(item(11, "b", Some(&["a"]), None));
         assert_eq!(hops_of(&items, 11), 2);
+        // A doc save that wakes someone counts as agent talk.
+        let mut save = item(20, "a", Some(&["b"]), None);
+        save.kind = "doc".into();
+        let mut probe = items.clone();
+        probe.push(save);
+        probe.push(item(21, "b", Some(&["a"]), None));
+        assert_eq!(hops_of(&probe, 21), 4);
         items.push(item(12, "a", None, None));
         assert_eq!(hops_of(&items, 12), 1);
     }

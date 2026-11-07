@@ -215,6 +215,36 @@ fn item_ref(py: Python<'_>, envelope_json: &str, blob: &[u8]) -> PyResult<String
     py.allow_threads(|| api::item_ref(envelope_json, blob)).map_err(err)
 }
 
+/// The item reference for an item whose blob this client does not hold,
+/// from the blob digest the relay reported; raises unless the author
+/// signed that digest.
+#[pyfunction]
+fn item_ref_from_digest(envelope_json: &str, blob_sha256: &str) -> PyResult<String> {
+    api::item_ref_from_digest(envelope_json, blob_sha256).map_err(err)
+}
+
+/// The session's docs, from a JSON list of `{envelope, blob_sha256, owner,
+/// seq}` for its doc items in relay order: a JSON list of
+/// `{id, meta, tabs}` chains with stamps.
+#[pyfunction]
+fn doc_index(py: Python<'_>, entries_json: &str) -> PyResult<String> {
+    py.allow_threads(|| api::doc_index(entries_json)).map_err(err)
+}
+
+/// Raises if a doc payload's meta (`doc_root`, `doc_meta` or `doc_tab`) is
+/// not valid.
+#[pyfunction]
+fn doc_check(meta_json: &str) -> PyResult<()> {
+    api::doc_check(meta_json).map_err(err)
+}
+
+/// A line diff from `a` to `b`: a JSON list of `[op, line]`, op one of
+/// `" "`, `"-"`, `"+"`.
+#[pyfunction]
+fn line_diff(py: Python<'_>, a: &str, b: &str) -> PyResult<String> {
+    py.allow_threads(|| api::line_diff(a, b)).map_err(err)
+}
+
 /// Bind a result to its job: same job reference, for a job aimed at one
 /// runner a result from that runner, and when approved_runners_json (a JSON
 /// list of approved runner keys) is given, an author on that list.
@@ -332,6 +362,10 @@ fn core_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open_checked, m)?)?;
     m.add_function(wrap_pyfunction!(item_ref, m)?)?;
     m.add_function(wrap_pyfunction!(check_result_for_job, m)?)?;
+    m.add_function(wrap_pyfunction!(item_ref_from_digest, m)?)?;
+    m.add_function(wrap_pyfunction!(doc_index, m)?)?;
+    m.add_function(wrap_pyfunction!(doc_check, m)?)?;
+    m.add_function(wrap_pyfunction!(line_diff, m)?)?;
     m.add_function(wrap_pyfunction!(inspect_zip, m)?)?;
     m.add_function(wrap_pyfunction!(check_zip_path, m)?)?;
     m.add_function(wrap_pyfunction!(check_cwd, m)?)?;
