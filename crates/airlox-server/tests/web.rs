@@ -9,7 +9,16 @@ use common::*;
 #[tokio::test(flavor = "multi_thread")]
 async fn pages_and_assets_carry_the_strict_csp() {
     let env = Env::new().await;
-    for path in ["/", "/new", "/s/ax_abcdefghijklmnopqrstuvwxyz", "/assets/app.js", "/assets/style.css"] {
+    for path in [
+        "/",
+        "/new",
+        "/s/ax_abcdefghijklmnopqrstuvwxyz",
+        "/assets/app.js",
+        "/assets/style.css",
+        "/favicon.ico",
+        "/apple-touch-icon.png",
+        "/assets/favicon.svg",
+    ] {
         let r = env.http.get(format!("{}{path}", env.base)).send().await.unwrap();
         assert_eq!(r.status(), StatusCode::OK, "{path}");
         assert_eq!(r.headers()[REFERRER_POLICY], "no-referrer", "{path}");

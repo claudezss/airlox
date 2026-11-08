@@ -64,6 +64,9 @@ pub fn router(state: api::AppState) -> Router {
         .route("/receive", get(web::receive_page))
         .route("/s/{id}", get(web::session_page))
         .route("/assets/{*path}", get(web::asset))
+        // Browsers and iOS ask for these at the root, whatever the page links.
+        .route("/favicon.ico", get(web::favicon))
+        .route("/apple-touch-icon.png", get(web::touch_icon))
         .layer(axum::middleware::map_response(no_store))
         .with_state(state)
 }

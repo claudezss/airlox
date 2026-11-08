@@ -159,6 +159,14 @@ pub async fn session_page(Path(_id): Path<String>, req: HeaderMap) -> Response {
     serve("index.html", &req).await
 }
 
+pub async fn favicon(req: HeaderMap) -> Response {
+    serve("favicon.ico", &req).await
+}
+
+pub async fn touch_icon(req: HeaderMap) -> Response {
+    serve("apple-touch-icon.png", &req).await
+}
+
 pub async fn asset(Path(path): Path<String>, req: HeaderMap) -> Response {
     if path.split('/').any(|p| p == ".." || p.is_empty()) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
