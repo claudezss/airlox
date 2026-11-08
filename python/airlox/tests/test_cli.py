@@ -759,6 +759,40 @@ def test_listen_wakes_only_for_what_concerns_you(relay, caches, tmp_path):
     assert "checked the relay at" in p.stderr and "latest #" in p.stderr
 
 
+def test_unanswered_questions_and_listener_status(relay, caches):
+    owner = Session.create(relay.url, display_name="lead", cache_dir=caches("owner"))
+    sender = owner.invites["sender"]
+    cli("session", "info", "--as", "coder", invite=sender, cache=caches("coder"))
+    ask = owner.send_text("which parser is faster? " + "details " * 100, to=["coder"])
+    owner.send_text("FYI: lunch at noon")
+
+    def open_questions():
+        p = cli("items", "--json", "--unanswered", "--max-chars", "40", invite=sender, cache=caches("coder"))
+        return [json.loads(line) for line in p.stdout.splitlines()]
+
+    [q, fyi] = open_questions()
+    assert (q["id"], q["answered"], len(q["text"]) <= 40) == (ask["id"], False, True)
+    assert "text_truncated" in q and fyi["text"] == "FYI: lunch at noon"
+    cli("send", "text", "the new one", "--reply-to", ask["id"], invite=sender, cache=caches("coder"))
+    assert [i["text"] for i in open_questions()] == ["FYI: lunch at noon"]
+    p = cli("items", "--json", "--for-me", invite=sender, cache=caches("coder"))
+    q = next(json.loads(line) for line in p.stdout.splitlines() if ask["id"] in line)
+    assert q["answered"] and [(r["mine"], r["author_name"]) for r in q["replies"]] == [(True, "coder")]
+
+    # watch reports its connection on stderr, and where to resume when it stops.
+    p = cli("watch", "--json", "--new", "--timeout", "2s", invite=sender, cache=caches("coder"), check=False)
+    states = [json.loads(line) for line in p.stderr.splitlines() if line.startswith("{")]
+    assert p.returncode == 75 and p.stdout == ""
+    assert [s["listener"] for s in states] == ["connected", "timed_out"], p.stderr
+    assert 0 < states[-1]["resume_after"] <= states[-1]["latest_seq"]
+
+    # --idle-timeout stops a listener that heard nothing for it.
+    start = time.time()
+    p = cli("listen", "--once", "--new", "--idle-timeout", "2s", "--timeout", "60s", invite=sender,
+            cache=caches("coder"), check=False)
+    assert p.returncode == 75 and time.time() - start < 30 and "idle timeout" in p.stderr, p.stderr
+
+
 def test_listen_agent_needs_a_conversation_to_wake(tmp_path):
     for args in (["--agent", "claude"], ["--agent", "codex"]):
         p = cli("listen", *args, check=False)

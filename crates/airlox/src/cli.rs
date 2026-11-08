@@ -1592,6 +1592,14 @@ pub struct ItemsArgs {
     /// results included), and the owner's messages to everyone.
     #[arg(long)]
     pub for_me: bool,
+    /// Only the messages and files for you that you have not answered yet
+    /// (answered: you posted an item with `--reply-to` it).
+    #[arg(long)]
+    pub unanswered: bool,
+    /// Cut text longer than this many bytes (with `--json`, Markdown and
+    /// Python files over it are left out); the item says how long it was.
+    #[arg(long, value_name = "BYTES")]
+    pub max_chars: Option<usize>,
 }
 
 impl ItemsArgs {
@@ -1599,6 +1607,7 @@ impl ItemsArgs {
         self.after.is_none_or(|a| i.seq > a)
             && !(self.not_mine && i.author == s.me)
             && !(self.for_me && s.wake_reason(i).is_none())
+            && (!self.unanswered || s.unanswered(i))
     }
 }
 
@@ -1625,12 +1634,125 @@ fn freshness(s: &Session, shown: usize) {
 pub struct WatchArgs {
     #[command(flatten)]
     pub items: ItemsArgs,
-    /// Only show items that arrive from now on.
-    #[arg(long)]
+    /// Only show items that arrive from now on. To pick up where an earlier
+    /// watch stopped, pass `--after <seq>` instead: the seq it printed last.
+    #[arg(long, conflicts_with = "after")]
     pub new: bool,
-    /// Stop after this long.
+    /// Stop after this long (exit 75).
     #[arg(long, value_parser = parse_duration)]
     pub timeout: Option<Duration>,
+    #[command(flatten)]
+    pub live: Liveness,
+}
+
+/// How a long-lived listener says it is still working, and when it stops.
+#[derive(Args, Debug)]
+pub struct Liveness {
+    /// Stop (exit 75) once this long has passed since you last posted, or
+    /// since an item for you arrived, counting from the start until then:
+    /// `--idle-timeout 24h` listens until a day after your last answer.
+    #[arg(long, value_parser = parse_duration)]
+    pub idle_timeout: Option<Duration>,
+    /// While connected, say so on stderr this often, with the latest seq,
+    /// so a quiet listener can be told from a dead one. Connecting, a drop
+    /// and reconnecting are reported as they happen. 0: no heartbeat.
+    /// Default 10m, or none for `listen --once`.
+    #[arg(long, value_parser = parse_duration)]
+    pub heartbeat: Option<Duration>,
+}
+
+const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(600);
+
+/// One line on stderr about a listener's state: `connected`,
+/// `reconnecting`, `alive`, `timed_out`, `idle_timeout` or `closed`. JSON
+/// with `--json` (an object with a `listener` key, which items never have),
+/// so stdout stays one item per line.
+fn listener_status(json: bool, state: &str, latest: Option<u64>, synced: Option<u64>, extra: Value) {
+    if json {
+        let mut v =
+            json!({"listener": state, "latest_seq": latest, "synced_at_ms": synced, "at_ms": now_ms()});
+        if let (Some(v), Some(extra)) = (v.as_object_mut(), extra.as_object()) {
+            v.extend(extra.clone());
+        }
+        eprintln!("{v}");
+        return;
+    }
+    let mut line = format!("airlox: {}", state.replace('_', " "));
+    if let Some(d) = extra["detail"].as_str() {
+        line += &format!(" ({})", clean_line(d));
+    }
+    line += &latest.map(|q| format!(" · latest #{q}")).unwrap_or_else(|| " · no events yet".into());
+    if let Some(t) = synced {
+        line += &format!(" · last heard from the relay {}", utc_clock(t));
+    }
+    if let Some(q) = extra["resume_after"].as_u64() {
+        line += &format!(" · resume with --after {q}");
+    }
+    eprintln!("{line}");
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Report the event stream's state changes (and heartbeats) on stderr.
+fn report_link(s: &mut Session, json: bool, heartbeat: Option<Duration>) {
+    s.heartbeat = heartbeat.filter(|h| !h.is_zero());
+    s.on_link = Some(Box::new(move |e| {
+        listener_status(json, e.state.as_str(), e.latest_seq, e.synced_at_ms, json!({"detail": e.detail}))
+    }));
+}
+
+/// When a listener stops: a fixed `--timeout`, and an `--idle-timeout`
+/// that starts again whenever you post or an item for you arrives.
+struct Deadline {
+    at: Option<std::time::Instant>,
+    idle: Option<Duration>,
+    active: std::time::Instant,
+    seen: u64,
+}
+
+impl Deadline {
+    fn new(s: &Session, timeout: Option<Duration>, idle: Option<Duration>) -> Self {
+        let now = std::time::Instant::now();
+        Deadline { at: timeout.map(|t| now + t), idle, active: now, seen: s.last_seq().unwrap_or(0) }
+    }
+
+    /// Restart the idle clock if you posted, or something for you arrived,
+    /// since the last call.
+    fn note(&mut self, s: &Session) {
+        let fresh = s.items().iter().rev().take_while(|i| i.seq > self.seen);
+        if fresh.into_iter().any(|i| i.author == s.me || s.wake_reason(i).is_some()) {
+            self.active = std::time::Instant::now();
+        }
+        self.seen = self.seen.max(s.last_seq().unwrap_or(0));
+    }
+
+    /// Time left until the nearer of the two, if either is set.
+    fn left(&self) -> Option<Duration> {
+        let now = std::time::Instant::now();
+        let fixed = self.at.map(|d| d.saturating_duration_since(now));
+        let idle = self.idle.map(|i| (self.active + i).saturating_duration_since(now));
+        match (fixed, idle) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Why to stop now, if it is time: `timed_out` or `idle_timeout`.
+    fn expired(&self) -> Option<&'static str> {
+        let now = std::time::Instant::now();
+        if self.at.is_some_and(|d| d <= now) {
+            Some("timed_out")
+        } else if self.idle.is_some_and(|i| self.active + i <= now) {
+            Some("idle_timeout")
+        } else {
+            None
+        }
+    }
 }
 
 /// One item as JSON: the verified header fields plus readable content.
@@ -1663,6 +1785,16 @@ pub fn item_json(s: &Session, i: &Item, max_content: Option<usize>) -> Value {
     }
     if let Some(why) = s.wake_reason(i) {
         v["for_me"] = json!(why);
+        if matches!(i.kind.as_str(), "text" | "file") {
+            v["answered"] = json!(!s.unanswered(i));
+        }
+    }
+    let replies: Vec<Value> = s
+        .replies(i)
+        .map(|r| json!({"seq": r.seq, "id": r.id, "author_name": r.author_name, "mine": r.author == s.me}))
+        .collect();
+    if !replies.is_empty() {
+        v["replies"] = json!(replies);
     }
     if let Some(e) = &i.error {
         v["error"] = json!(e);
@@ -1852,13 +1984,18 @@ fn emit(s: &Session, i: &Item, a: &ItemsArgs) -> Result<()> {
         _ => None,
     };
     if a.conn.json {
-        let mut v = item_json(s, i, None);
+        let mut v = item_json(s, i, a.max_chars);
         if let Some(p) = saved {
             v["saved"] = json!(p);
         }
         println!("{}", serde_json::to_string(&v)?);
     } else {
-        println!("{}", item_line(s, i));
+        let mut line = item_line(s, i);
+        if let Some(max) = a.max_chars.filter(|&m| line.len() > m) {
+            let cut = (0..=max).rev().find(|&i| line.is_char_boundary(i)).unwrap_or(0);
+            line = format!("{}… [cut: {} bytes in all]", &line[..cut], line.len());
+        }
+        println!("{line}");
         if let Some(p) = saved {
             println!("       saved {p}");
         }
@@ -1879,27 +2016,42 @@ pub async fn items(a: ItemsArgs) -> Result<()> {
     Ok(())
 }
 
-/// Print items as they arrive (after the history, unless `--new`).
-pub async fn watch(a: WatchArgs) -> Result<()> {
+/// Print items as they arrive (after the history, unless `--new`), with
+/// the connection's state on stderr. Exits 75 when a timeout ends it, and
+/// says which `--after` picks up from there.
+pub async fn watch(a: WatchArgs) -> Result<i32> {
     let mut s = a.items.conn.join().await?;
     s.sync().await?;
+    let json = a.items.conn.json;
+    report_link(&mut s, json, Some(a.live.heartbeat.unwrap_or(DEFAULT_HEARTBEAT)));
     if !a.new {
         for i in s.items().iter().filter(|i| a.items.shows(&s, i)) {
             emit(&s, i, &a.items)?;
         }
     }
     let args = &a.items;
-    s.stream(a.timeout, &mut |s, i| {
-        if args.shows(s, i) {
-            emit(s, i, args)?;
+    let mut clock = Deadline::new(&s, a.timeout, a.live.idle_timeout);
+    let why = loop {
+        if let Some(why) = clock.expired() {
+            break why;
         }
-        Ok(true)
-    })
-    .await?;
-    if let Some(c) = &s.closed {
-        eprintln!("session ended: {}", clean_line(c));
-    }
-    Ok(())
+        s.stream(clock.left(), &mut |s, i| {
+            if args.shows(s, i) {
+                emit(s, i, args)?;
+            }
+            Ok(true)
+        })
+        .await?;
+        if s.closed.is_some() {
+            break "closed";
+        }
+        clock.note(&s);
+    };
+    // Every item up to here was shown (or filtered out), except any still
+    // being fetched: resume just below the first of those.
+    let extra = json!({"detail": s.closed, "resume_after": s.settled_seq().or(a.items.after)});
+    listener_status(json, why, s.last_seq(), s.synced_at_ms, extra);
+    Ok(if why == "closed" { 0 } else { 75 })
 }
 
 /// For this participant's own recent items: who fetched each, and who it
@@ -2036,6 +2188,8 @@ pub struct ListenArgs {
     /// (or the start, the first time).
     #[arg(long)]
     pub new: bool,
+    #[command(flatten)]
+    pub live: Liveness,
 }
 
 /// Wait for items meant for this participant and hand them over: print and
@@ -2047,8 +2201,14 @@ pub async fn listen(a: ListenArgs) -> Result<i32> {
     }
     let mut s = a.conn.join().await?;
     s.sync().await?;
-    let deadline = a.timeout.map(|t| std::time::Instant::now() + t);
-    let left = || deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
+    let json = a.conn.json;
+    // `--once` output is read in full when it exits: no heartbeat unless asked.
+    let beat = a.live.heartbeat.or((!a.once).then_some(DEFAULT_HEARTBEAT));
+    report_link(&mut s, json, beat);
+    let mut clock = Deadline::new(&s, a.timeout, a.live.idle_timeout);
+    let stop = |s: &Session, why: &str| {
+        listener_status(json, why, s.last_seq(), s.synced_at_ms, json!({"detail": s.closed}));
+    };
     let mut cursor = if a.new { s.settled_seq().unwrap_or(0) } else { s.handled_seq().unwrap_or(0) };
     let mut skipped = std::collections::HashSet::new();
     let mut pending =
@@ -2069,6 +2229,7 @@ pub async fn listen(a: ListenArgs) -> Result<i32> {
         forward_signals();
     }
     loop {
+        clock.note(&s);
         let now = std::time::Instant::now();
         let upto = pending.settled_seq(s.items(), now).unwrap_or(0);
         // Items given up on that arrived since: wake for them too. This is
@@ -2102,11 +2263,12 @@ pub async fn listen(a: ListenArgs) -> Result<i32> {
         }
         cursor = cursor.max(upto);
         s.mark_handled(cursor)?;
-        if let Some(c) = &s.closed {
-            eprintln!("session ended: {}", clean_line(c));
+        if s.closed.is_some() {
+            stop(&s, "closed");
             return Ok(if a.once { 1 } else { 0 });
         }
-        if left() == Some(Duration::ZERO) {
+        if let Some(why) = clock.expired() {
+            stop(&s, why);
             return Ok(75);
         }
         // Block on the event stream until something that wakes arrives,
@@ -2116,7 +2278,7 @@ pub async fn listen(a: ListenArgs) -> Result<i32> {
         // Items already here: one that shows up again was pending and has
         // arrived, which may free a held item or be a late one to wake for.
         let known = s.items().iter().map(|i| i.seq).max().unwrap_or(0);
-        let mut wait = left().unwrap_or(Duration::from_secs(300)).min(Duration::from_secs(300));
+        let mut wait = clock.left().unwrap_or(Duration::from_secs(300)).min(Duration::from_secs(300));
         // Come back when a pending item is due to be skipped.
         if let Some(due) = pending.next_check(std::time::Instant::now()) {
             wait = wait.min(due.max(Duration::from_millis(100)));
@@ -2127,7 +2289,7 @@ pub async fn listen(a: ListenArgs) -> Result<i32> {
         })
         .await?;
         if woke {
-            tokio::time::sleep(a.settle.min(left().unwrap_or(Duration::MAX))).await;
+            tokio::time::sleep(a.settle.min(clock.left().unwrap_or(Duration::MAX))).await;
         }
         s.sync().await?;
     }

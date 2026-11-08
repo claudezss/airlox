@@ -822,6 +822,51 @@ pub struct Session {
     /// This process joined as a new participant (no cached identity), so
     /// the name and description it gave are the ones others see.
     pub joined_now: bool,
+    /// Item id -> indexes of the items that reply to it (their first ref).
+    replies: HashMap<String, Vec<usize>>,
+    /// Told when the event stream connects, drops, or (every `heartbeat`)
+    /// is still alive, so a quiet listener can be told from a dead one.
+    pub on_link: Option<OnLink>,
+    /// How often [`Session::stream`] reports that the stream is alive.
+    pub heartbeat: Option<Duration>,
+    /// Whether the event stream is up: unknown until the first attempt.
+    link_up: Option<bool>,
+    last_beat: Option<Instant>,
+}
+
+/// What [`Session::stream`] tells about the event stream's state.
+pub type OnLink = Box<dyn FnMut(&LinkEvent) + Send + Sync>;
+
+/// The state of the event stream, as [`Session::stream`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkState {
+    /// Connected (or connected again after a drop).
+    Connected,
+    /// The stream dropped or went quiet; retrying.
+    Reconnecting,
+    /// Still connected: the relay's keep-alives keep arriving.
+    Alive,
+}
+
+impl LinkState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkState::Connected => "connected",
+            LinkState::Reconnecting => "reconnecting",
+            LinkState::Alive => "alive",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LinkEvent {
+    pub state: LinkState,
+    /// Why, for `Reconnecting`.
+    pub detail: Option<String>,
+    /// The latest event this client has.
+    pub latest_seq: Option<u64>,
+    /// When this client last heard from the relay.
+    pub synced_at_ms: Option<u64>,
 }
 
 impl Session {
@@ -958,6 +1003,11 @@ impl Session {
             synced_at_ms: None,
             closed: None,
             joined_now,
+            replies: HashMap::new(),
+            on_link: None,
+            heartbeat: None,
+            link_up: None,
+            last_beat: None,
         };
         // Which blobs the relay lacks now, so replayed items without a
         // cached blob come out evicted rather than pending.
@@ -1769,6 +1819,25 @@ impl Session {
         None
     }
 
+    /// The available items that reply to `item` (name it in their first
+    /// reference), oldest first.
+    pub fn replies(&self, item: &Item) -> impl Iterator<Item = &Item> {
+        self.replies
+            .get(&item.id)
+            .into_iter()
+            .flatten()
+            .map(|&i| &self.items[i])
+            .filter(|r| r.status == Status::Ok)
+    }
+
+    /// Whether `item` concerns you, could need an answer (a text or file
+    /// from someone else), and you have not replied to it yet.
+    pub fn unanswered(&self, item: &Item) -> bool {
+        matches!(item.kind.as_str(), "text" | "file")
+            && self.wake_reason(item).is_some()
+            && !self.replies(item).any(|r| r.author == self.me)
+    }
+
     /// The item `item` replies to (its first reference), if this client has it.
     pub fn parent(&self, item: &Item) -> Option<&Item> {
         self.get(item.reply_to()?)
@@ -1953,20 +2022,37 @@ impl Session {
                     return Ok(());
                 }
                 Err(e) if is_transient(&e) => {
+                    self.link(LinkState::Reconnecting, Some(format!("cannot reach the relay: {e:#}")));
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     continue;
                 }
                 Err(e) => return Err(e),
             };
+            self.link(LinkState::Connected, None);
             let mut body = resp.bytes_stream();
             let mut parser = SseParser::default();
             loop {
                 let wait = left(deadline).unwrap_or(Duration::from_secs(60)).min(Duration::from_secs(60));
                 let chunk = match tokio::time::timeout(wait, body.next()).await {
-                    Err(_) => break, // quiet: reconnect, or stop at the deadline
+                    // Quiet: stop at the deadline, or reconnect. The relay
+                    // sends keep-alives every few seconds, so a whole quiet
+                    // minute means the connection has stalled.
+                    Err(_) => {
+                        if left(deadline) != Some(Duration::ZERO) {
+                            self.link(
+                                LinkState::Reconnecting,
+                                Some("no data from the relay for 60 s".into()),
+                            );
+                        }
+                        break;
+                    }
                     Ok(None) | Ok(Some(Err(_))) => {
-                        // Dropped: pause before reconnecting, so a relay that
-                        // keeps hanging up does not get a tight loop.
+                        self.link(
+                            LinkState::Reconnecting,
+                            Some("the connection to the relay dropped".into()),
+                        );
+                        // Pause before reconnecting, so a relay that keeps
+                        // hanging up does not get a tight loop.
                         let pause = left(deadline).unwrap_or(Duration::MAX).min(Duration::from_secs(1));
                         tokio::time::sleep(pause).await;
                         break;
@@ -1974,6 +2060,9 @@ impl Session {
                     Ok(Some(Ok(c))) => c,
                 };
                 self.synced_at_ms = Some(now_ms());
+                if self.heartbeat.is_some_and(|h| self.last_beat.is_none_or(|t| t.elapsed() >= h)) {
+                    self.link(LinkState::Alive, None);
+                }
                 let mut trade = false;
                 for ev in parser.push(&chunk) {
                     trade |= matches!(ev.event.as_str(), "want" | "reseeded" | "evicted");
@@ -2003,6 +2092,25 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Report a change in the event stream's state (or a heartbeat) to
+    /// `on_link`. Repeats of the same state are not reported.
+    fn link(&mut self, state: LinkState, detail: Option<String>) {
+        let up = match state {
+            LinkState::Connected => true,
+            LinkState::Reconnecting => false,
+            LinkState::Alive => self.link_up.unwrap_or(true),
+        };
+        if state != LinkState::Alive && self.link_up == Some(up) {
+            return;
+        }
+        self.link_up = Some(up);
+        self.last_beat = Some(Instant::now());
+        let ev = LinkEvent { state, detail, latest_seq: self.last_seq, synced_at_ms: self.synced_at_ms };
+        if let Some(f) = self.on_link.as_mut() {
+            f(&ev);
+        }
     }
 
     /// Apply one event; returns the index of the item it carried, if any.
@@ -2198,6 +2306,9 @@ impl Session {
                 }
                 None => {
                     s.index.insert(item.id.clone(), s.items.len());
+                    if let Some(parent) = item.reply_to() {
+                        s.replies.entry(parent.to_string()).or_default().push(s.items.len());
+                    }
                     s.items.push(item);
                     s.items.len() - 1
                 }
