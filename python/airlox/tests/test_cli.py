@@ -759,6 +759,102 @@ def test_listen_wakes_only_for_what_concerns_you(relay, caches, tmp_path):
     assert "checked the relay at" in p.stderr and "latest #" in p.stderr
 
 
+def test_unanswered_questions_and_listener_status(relay, caches):
+    owner = Session.create(relay.url, display_name="lead", cache_dir=caches("owner"))
+    sender = owner.invites["sender"]
+    cli("session", "info", "--as", "coder", invite=sender, cache=caches("coder"))
+    ask = owner.send_text("which parser is faster? " + "details " * 100, to=["coder"])
+    owner.send_text("FYI: lunch at noon")
+
+    def open_questions():
+        p = cli("items", "--json", "--unanswered", "--max-bytes", "40", invite=sender, cache=caches("coder"))
+        return [json.loads(line) for line in p.stdout.splitlines()]
+
+    [q, fyi] = open_questions()
+    assert (q["id"], q["answered"], len(q["text"]) <= 40) == (ask["id"], False, True)
+    assert "text_truncated" in q and fyi["text"] == "FYI: lunch at noon"
+    cli("send", "text", "the new one", "--reply-to", ask["id"], invite=sender, cache=caches("coder"))
+    assert [i["text"] for i in open_questions()] == ["FYI: lunch at noon"]
+    p = cli("items", "--json", "--for-me", invite=sender, cache=caches("coder"))
+    q = next(json.loads(line) for line in p.stdout.splitlines() if ask["id"] in line)
+    assert q["answered"] and [(r["mine"], r["author_name"]) for r in q["replies"]] == [(True, "coder")]
+    assert q["replies_total"] == 1
+    # An answer to the coder's own question needs no answer back.
+    mine = json.loads(cli("send", "text", "--json", "is the old one still used?", invite=sender,
+                          cache=caches("coder")).stdout)
+    owner.send_text("no", reply_to=mine["sent"]["id"])
+    assert [i["text"] for i in open_questions()] == ["FYI: lunch at noon"]
+
+    # watch reports its connection on stderr, and where to resume when it stops.
+    p = cli("watch", "--json", "--new", "--timeout", "2s", invite=sender, cache=caches("coder"), check=False)
+    states = [json.loads(line) for line in p.stderr.splitlines() if line.startswith("{")]
+    assert p.returncode == 75 and p.stdout == ""
+    assert [s["listener"] for s in states] == ["connected", "timed_out"], p.stderr
+    assert 0 < states[-1]["resume_after"] <= states[-1]["latest_seq"]
+
+    # --idle-timeout stops a listener that heard nothing for it.
+    start = time.time()
+    p = cli("listen", "--once", "--new", "--idle-timeout", "2s", "--timeout", "60s", invite=sender,
+            cache=caches("coder"), check=False)
+    assert p.returncode == 75 and time.time() - start < 30 and "--idle-timeout passed" in p.stderr, p.stderr
+
+    # A message for you restarts the idle wait from when it arrived.
+    env = {**os.environ, "AIRLOX_INVITE": sender, "AIRLOX_CACHE_DIR": str(caches("coder"))}
+    start = time.time()
+    watch = subprocess.Popen([BIN, "watch", "--json", "--new", "--idle-timeout", "4s"], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(2)
+    owner.send_text("still there?", to=["coder"])
+    out, err = watch.communicate(timeout=30)
+    took = time.time() - start
+    assert watch.returncode == 75 and "still there?" in out, err
+    assert 5.5 < took < 8.5, (took, err)
+
+
+def test_listen_always_wakes_for_the_owner(relay, caches):
+    # Live test: a session run from the CLI (no web participant) once had the
+    # loop guard count the owner's own posts as an agent's, so after 8 of
+    # them the owner's messages to a worker were silently held back.
+    owner = Session.create(relay.url, display_name="lead", cache_dir=caches("owner"))
+    sender = owner.invites["sender"]
+    helper = Session.join(sender, display_name="helper", cache_dir=caches("helper"))
+    cli("session", "info", "--as", "coder", invite=sender, cache=caches("coder"))
+    for n in range(6):
+        owner.send_text(f"note {n}")
+        helper.send_text(f"helper note {n}")
+    ask = owner.send_text("coder: one question", to=["coder"])
+    p = cli("listen", "--once", "--json", "--timeout", "20s", invite=sender, cache=caches("coder"))
+    woke = [json.loads(line) for line in p.stdout.splitlines()]
+    assert ask["id"] in [w["id"] for w in woke], p.stderr
+    status = [json.loads(line) for line in p.stderr.splitlines() if line.startswith("{")]
+    assert "woke" in [st["listener"] for st in status], p.stderr
+
+    # A helper's addressed message after a long agent run is still held back,
+    # and listen says so, and counts it when it stops.
+    for n in range(9):
+        helper.send_text(f"more {n}")
+    held = helper.send_text("coder: from the helper", to=["coder"])
+    p = cli("listen", "--once", "--json", "--timeout", "3s", invite=sender, cache=caches("coder"), check=False)
+    status = [json.loads(line) for line in p.stderr.splitlines() if line.startswith("{")]
+    assert p.returncode == 75 and p.stdout == "", p.stderr
+    skipped = [st for st in status if st["listener"] == "skipped"]
+    assert [st["id"] for st in skipped] == [held["id"]], p.stderr
+    assert status[-1]["listener"] == "timed_out" and status[-1]["skipped"] == 1, p.stderr
+
+    # --after starts somewhere other than the saved cursor.
+    p = cli("listen", "--once", "--json", "--after", "0", "--max-hops", "0", "--timeout", "10s", invite=sender,
+            cache=caches("coder"))
+    assert ask["id"] in [json.loads(line)["id"] for line in p.stdout.splitlines()]
+    # ... for that run only: the saved cursor is where the earlier run left
+    # it (past everything), so nothing wakes again; a cursor past the end is
+    # refused, as it would mute the listener.
+    p = cli("listen", "--once", "--json", "--max-hops", "0", "--timeout", "10s", invite=sender,
+            cache=caches("coder"), check=False)
+    assert p.returncode == 75, p.stderr
+    p = cli("listen", "--once", "--after", "99999", invite=sender, cache=caches("coder"), check=False)
+    assert p.returncode != 0 and "past the latest item" in p.stderr, p.stderr
+
+
 def test_listen_agent_needs_a_conversation_to_wake(tmp_path):
     for args in (["--agent", "claude"], ["--agent", "codex"]):
         p = cli("listen", *args, check=False)

@@ -199,7 +199,7 @@ fn main() -> std::process::ExitCode {
             Cmd::Machine(c) => machine::machine(c).await.map(|()| 0),
             Cmd::Doc(c) => doc_cli::doc(c).await,
             Cmd::Items(a) => cli::items(a).await.map(|()| 0),
-            Cmd::Watch(a) => cli::watch(a).await.map(|()| 0),
+            Cmd::Watch(a) => cli::watch(a).await,
             Cmd::Listen(a) => cli::listen(a).await,
             Cmd::Delivery(c) => cli::delivery(c).await.map(|()| 0),
             Cmd::Receive(a) => cli::receive(a).await.map(|()| 0),
