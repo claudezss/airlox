@@ -1830,12 +1830,15 @@ impl Session {
             .filter(|r| r.status == Status::Ok)
     }
 
-    /// Whether `item` concerns you, could need an answer (a text or file
-    /// from someone else), and you have not replied to it yet.
+    /// Whether `item` is a message or file addressed to you, or the owner's
+    /// to everyone, that you have not replied to yet. Replies to your own
+    /// items are left out: most are answers, which need none. A reply of
+    /// yours counts whatever its state (still being fetched, say), so a
+    /// question is not answered twice.
     pub fn unanswered(&self, item: &Item) -> bool {
         matches!(item.kind.as_str(), "text" | "file")
-            && self.wake_reason(item).is_some()
-            && !self.replies(item).any(|r| r.author == self.me)
+            && matches!(self.wake_reason(item), Some("addressed" | "owner"))
+            && !self.replies.get(&item.id).is_some_and(|r| r.iter().any(|&i| self.items[i].author == self.me))
     }
 
     /// The item `item` replies to (its first reference), if this client has it.
@@ -2047,10 +2050,12 @@ impl Session {
                         break;
                     }
                     Ok(None) | Ok(Some(Err(_))) => {
-                        self.link(
-                            LinkState::Reconnecting,
-                            Some("the connection to the relay dropped".into()),
-                        );
+                        if left(deadline) != Some(Duration::ZERO) {
+                            self.link(
+                                LinkState::Reconnecting,
+                                Some("the connection to the relay dropped".into()),
+                            );
+                        }
                         // Pause before reconnecting, so a relay that keeps
                         // hanging up does not get a tight loop.
                         let pause = left(deadline).unwrap_or(Duration::MAX).min(Duration::from_secs(1));
@@ -2095,14 +2100,18 @@ impl Session {
     }
 
     /// Report a change in the event stream's state (or a heartbeat) to
-    /// `on_link`. Repeats of the same state are not reported.
+    /// `on_link`. Repeats of the same state are not reported, except that
+    /// while the relay cannot be reached that is said again every
+    /// `heartbeat`.
     fn link(&mut self, state: LinkState, detail: Option<String>) {
         let up = match state {
             LinkState::Connected => true,
             LinkState::Reconnecting => false,
             LinkState::Alive => self.link_up.unwrap_or(true),
         };
-        if state != LinkState::Alive && self.link_up == Some(up) {
+        let beat_due = self.heartbeat.is_some_and(|h| self.last_beat.is_none_or(|t| t.elapsed() >= h));
+        let repeat = state == LinkState::Reconnecting && beat_due;
+        if state != LinkState::Alive && self.link_up == Some(up) && !repeat {
             return;
         }
         self.link_up = Some(up);

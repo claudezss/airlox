@@ -767,7 +767,7 @@ def test_unanswered_questions_and_listener_status(relay, caches):
     owner.send_text("FYI: lunch at noon")
 
     def open_questions():
-        p = cli("items", "--json", "--unanswered", "--max-chars", "40", invite=sender, cache=caches("coder"))
+        p = cli("items", "--json", "--unanswered", "--max-bytes", "40", invite=sender, cache=caches("coder"))
         return [json.loads(line) for line in p.stdout.splitlines()]
 
     [q, fyi] = open_questions()
@@ -778,6 +778,12 @@ def test_unanswered_questions_and_listener_status(relay, caches):
     p = cli("items", "--json", "--for-me", invite=sender, cache=caches("coder"))
     q = next(json.loads(line) for line in p.stdout.splitlines() if ask["id"] in line)
     assert q["answered"] and [(r["mine"], r["author_name"]) for r in q["replies"]] == [(True, "coder")]
+    assert q["replies_total"] == 1
+    # An answer to the coder's own question needs no answer back.
+    mine = json.loads(cli("send", "text", "--json", "is the old one still used?", invite=sender,
+                          cache=caches("coder")).stdout)
+    owner.send_text("no", reply_to=mine["sent"]["id"])
+    assert [i["text"] for i in open_questions()] == ["FYI: lunch at noon"]
 
     # watch reports its connection on stderr, and where to resume when it stops.
     p = cli("watch", "--json", "--new", "--timeout", "2s", invite=sender, cache=caches("coder"), check=False)
@@ -790,7 +796,19 @@ def test_unanswered_questions_and_listener_status(relay, caches):
     start = time.time()
     p = cli("listen", "--once", "--new", "--idle-timeout", "2s", "--timeout", "60s", invite=sender,
             cache=caches("coder"), check=False)
-    assert p.returncode == 75 and time.time() - start < 30 and "idle timeout" in p.stderr, p.stderr
+    assert p.returncode == 75 and time.time() - start < 30 and "--idle-timeout passed" in p.stderr, p.stderr
+
+    # A message for you restarts the idle wait from when it arrived.
+    env = {**os.environ, "AIRLOX_INVITE": sender, "AIRLOX_CACHE_DIR": str(caches("coder"))}
+    start = time.time()
+    watch = subprocess.Popen([BIN, "watch", "--json", "--new", "--idle-timeout", "4s"], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(2)
+    owner.send_text("still there?", to=["coder"])
+    out, err = watch.communicate(timeout=30)
+    took = time.time() - start
+    assert watch.returncode == 75 and "still there?" in out, err
+    assert 5.5 < took < 8.5, (took, err)
 
 
 def test_listen_agent_needs_a_conversation_to_wake(tmp_path):
