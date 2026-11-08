@@ -811,6 +811,42 @@ def test_unanswered_questions_and_listener_status(relay, caches):
     assert 5.5 < took < 8.5, (took, err)
 
 
+def test_listen_always_wakes_for_the_owner(relay, caches):
+    # Live test: a session run from the CLI (no web participant) once had the
+    # loop guard count the owner's own posts as an agent's, so after 8 of
+    # them the owner's messages to a worker were silently held back.
+    owner = Session.create(relay.url, display_name="lead", cache_dir=caches("owner"))
+    sender = owner.invites["sender"]
+    helper = Session.join(sender, display_name="helper", cache_dir=caches("helper"))
+    cli("session", "info", "--as", "coder", invite=sender, cache=caches("coder"))
+    for n in range(6):
+        owner.send_text(f"note {n}")
+        helper.send_text(f"helper note {n}")
+    ask = owner.send_text("coder: one question", to=["coder"])
+    p = cli("listen", "--once", "--json", "--timeout", "20s", invite=sender, cache=caches("coder"))
+    woke = [json.loads(line) for line in p.stdout.splitlines()]
+    assert ask["id"] in [w["id"] for w in woke], p.stderr
+    status = [json.loads(line) for line in p.stderr.splitlines() if line.startswith("{")]
+    assert "woke" in [st["listener"] for st in status], p.stderr
+
+    # A helper's addressed message after a long agent run is still held back,
+    # and listen says so, and counts it when it stops.
+    for n in range(9):
+        helper.send_text(f"more {n}")
+    held = helper.send_text("coder: from the helper", to=["coder"])
+    p = cli("listen", "--once", "--json", "--timeout", "3s", invite=sender, cache=caches("coder"), check=False)
+    status = [json.loads(line) for line in p.stderr.splitlines() if line.startswith("{")]
+    assert p.returncode == 75 and p.stdout == "", p.stderr
+    skipped = [st for st in status if st["listener"] == "skipped"]
+    assert [st["id"] for st in skipped] == [held["id"]], p.stderr
+    assert status[-1]["listener"] == "timed_out" and status[-1]["skipped"] == 1, p.stderr
+
+    # --after starts somewhere other than the saved cursor.
+    p = cli("listen", "--once", "--json", "--after", "0", "--max-hops", "0", "--timeout", "10s", invite=sender,
+            cache=caches("coder"))
+    assert ask["id"] in [json.loads(line)["id"] for line in p.stdout.splitlines()]
+
+
 def test_listen_agent_needs_a_conversation_to_wake(tmp_path):
     for args in (["--agent", "claude"], ["--agent", "codex"]):
         p = cli("listen", *args, check=False)

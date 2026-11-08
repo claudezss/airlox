@@ -1846,16 +1846,25 @@ impl Session {
         self.get(item.reply_to()?)
     }
 
-    /// How many items in a row were posted by programs (anything but the web
-    /// client) rather than a person, which listeners use to stop waking
-    /// agents for long agent-only exchanges: the items up `item`'s reply
-    /// chain, or for an addressed item that replies to nothing, the text
-    /// items just before it since a web participant last spoke, whichever
-    /// is more. Participant kind is self-declared, so this is a safety net
-    /// against accidental loops, not a security boundary.
+    /// How many items in a row were posted by programs rather than a person,
+    /// which listeners use to stop waking agents for long agent-only
+    /// exchanges: the items up `item`'s reply chain, or for an addressed item
+    /// that replies to nothing, the text items just before it since a person
+    /// last spoke, whichever is more. A person is a web participant or, for
+    /// anyone but the owner, the owner (whatever client it uses): the owner's
+    /// words are what a worker is there for, so they always get through and
+    /// start the count again. The owner's own listener counts the owner's
+    /// CLI posts as a program's, so an owner agent and a worker cannot keep
+    /// each other going. Participant kind is self-declared, so this is a
+    /// safety net against accidental loops, not a security boundary.
     pub fn agent_hops(&self, item: &Item) -> usize {
-        let web = |author: &str| self.participants.get(author).is_some_and(|p| p.kind == "web");
-        hops(&self.items, &self.index, &web, item)
+        let owner_is_person = self.role != Role::Owner;
+        let person = |author: &str| {
+            self.participants
+                .get(author)
+                .is_some_and(|p| p.kind == "web" || (owner_is_person && p.role == "owner"))
+        };
+        hops(&self.items, &self.index, &person, item)
     }
 
     /// Whether `item`'s author is one of `specs` (any author if empty): the
