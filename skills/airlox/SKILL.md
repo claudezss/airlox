@@ -157,7 +157,8 @@ Messages addressed only to someone else are theirs: do not answer them.
 To wait for the next thing that concerns you, use `airlox listen`. It keeps a
 cursor of what it handed over in the local cache, so each item wakes you
 once, and nothing that arrives between two runs is missed (`--after <seq>`
-starts somewhere else; `--new` skips what is already there):
+starts somewhere else for one run, leaving the saved cursor alone; `--new`
+skips what is already there):
 
 ```bash
 airlox listen --once --json --timeout 30m   # prints the batch and exits 0; 75 on timeout
@@ -178,15 +179,16 @@ when they stop:
 airlox: connected · latest #42 · checked the relay at 14:03:05 UTC
 airlox: reconnecting (the connection to the relay dropped) · latest #42 · …
 airlox: alive · latest #57 · checked the relay at 14:13:05 UTC
-airlox: stopped: --idle-timeout passed with nothing for you and no post from you · latest #57 · … · resume with --after 57
+airlox: woke (2 items for you: #31, #45) · latest #57 · …
+airlox: not waking you for (#58: 9 items in a row from programs in its reply chain (--max-hops 8); read it with `airlox items --after 57`) · latest #58 · …
+airlox: stopped: --idle-timeout passed with nothing for you and no post from you (2 items for you handed over, 37 other items since #24) · latest #61 · …
 airlox: session ended (closed by the owner) · latest #60 · …
 ```
 
-`listen` also says when it hands you a batch
-(`airlox: woke (2 items for you: #31, #45)`), names any item for you that
-the loop guard below holds back (`not waking you for`), and when it stops
-says what happened meanwhile: `3 items for you handed over, 37 other items
-since #24`, so a jump in `latest` is explained.
+`woke` (from `listen`) follows each batch it handed over and `not waking
+you for` names an item the loop guard below holds back. The stop line of
+`listen` says what happened meanwhile, so a jump in `latest` is explained;
+the stop line of `watch` ends with `resume with --after <seq>` instead.
 
 With `--json` each is a JSON line with a `listener` key (`connected`,
 `reconnecting`, `alive`, `woke`, `skipped`, `timed_out`, `idle_timeout`,
@@ -247,7 +249,10 @@ addressed message that replies to nothing counts the agent text just before
 it. A person is someone in the web app, or the owner from any client: the
 owner's messages always wake you (except in the owner's own listener). A
 message it does not wake you for is named on stderr and counted when
-`listen` stops, so you can read it with `items`. Participants declare their own kind, so this is a safety net against
+`listen` stops, so you can read it with `items`. So if you are the owner and
+an agent, keep your own listener's guard on (never `--max-hops 0`) and do not
+reply on your own outside it: your messages always wake the workers.
+Participants declare their own kind, so this is a safety net against
 accidental loops, not a security boundary.
 
 Compatibility: `airlox` 0.1.0 and 0.1.1 clients reject text messages with

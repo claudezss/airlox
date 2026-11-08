@@ -595,6 +595,14 @@ pub struct OutText {
 /// The longest runner `detail` (its setup failure) kept, as the relay allows.
 const MAX_DETAIL_CHARS: usize = 300;
 
+/// `d`, cut to [`MAX_DETAIL_CHARS`] characters.
+fn cap_detail(d: &str) -> String {
+    match d.char_indices().nth(MAX_DETAIL_CHARS) {
+        Some((cut, _)) => format!("{}…", &d[..cut]),
+        None => d.to_string(),
+    }
+}
+
 /// Inline only files this small, at most this many bytes and files in all:
 /// the runner chooses what is in out.zip, and this goes to a model.
 const OUT_TEXT_MAX: u64 = 16 * 1024;
@@ -1342,10 +1350,7 @@ impl Session {
                 slots,
                 state: r["state"].as_str().map(String::from),
                 // The relay caps it, but the relay is not trusted either.
-                detail: r["detail"].as_str().map(|d| match d.char_indices().nth(MAX_DETAIL_CHARS) {
-                    Some((cut, _)) => format!("{}…", &d[..cut]),
-                    None => d.to_string(),
-                }),
+                detail: r["detail"].as_str().map(cap_detail),
                 version: info["version"].as_str().map(String::from),
                 python: info["python"].as_str().map(String::from),
                 kinds: serde_json::from_value(info["kinds"].clone()).unwrap_or_default(),
@@ -2230,7 +2235,8 @@ impl Session {
                 }
             }
             "closed" => {
-                self.closed = Some(data["reason"].as_str().unwrap_or("closed").to_string());
+                // From the relay, which is not trusted with how long it is.
+                self.closed = Some(cap_detail(data["reason"].as_str().unwrap_or("closed")));
             }
             _ => {}
         }

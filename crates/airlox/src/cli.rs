@@ -2198,7 +2198,9 @@ pub struct ListenArgs {
     /// person is a web participant, or the owner from any client (except in
     /// the owner's own listener), so the owner's messages always wake you.
     /// Kinds are self-declared, so this is a safety net, not a security
-    /// boundary. 0 turns it off.
+    /// boundary. 0 turns it off; an owner agent should never do that, nor
+    /// reply on its own outside a listener, since its messages always wake
+    /// the workers.
     #[arg(long, default_value_t = 8)]
     pub max_hops: usize,
     /// How long to wait for more items before waking, so a burst arrives
@@ -2225,7 +2227,8 @@ pub struct ListenArgs {
     #[arg(long)]
     pub new: bool,
     /// Start after this sequence number instead of the saved cursor (which
-    /// listen keeps for you, so this is rarely needed).
+    /// listen keeps for you, so this is rarely needed). A run started this
+    /// way leaves the saved cursor as it was.
     #[arg(long, value_name = "SEQ", conflicts_with = "new")]
     pub after: Option<u64>,
     #[command(flatten)]
@@ -2246,6 +2249,14 @@ pub async fn listen(a: ListenArgs) -> Result<i32> {
     let beat = a.live.heartbeat.or((!a.once).then_some(DEFAULT_HEARTBEAT));
     report_link(&mut s, json, beat);
     let mut clock = Deadline::new(a.timeout, a.live.idle_timeout);
+    if let (Some(after), Some(latest)) = (a.after, s.last_seq()) {
+        if after > latest {
+            bail!("--after {after} is past the latest item (#{latest}): nothing would ever wake you");
+        }
+    }
+    // A run from an explicit --after is a one-off look: saving its cursor
+    // would skip, for good, whatever lies between the saved one and it.
+    let save = a.after.is_none();
     let mut cursor = match (a.after, a.new) {
         (Some(after), _) => after,
         (None, true) => s.settled_seq().unwrap_or(0),
@@ -2322,18 +2333,22 @@ pub async fn listen(a: ListenArgs) -> Result<i32> {
                 "detail": format!("{} item{} for you: {}", batch.len(), if batch.len() == 1 { "" } else { "s" }, seqs.join(", ")),
                 "items": batch.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
             });
+            deliver(&s, &batch, &a).await?;
             listener_status(json, "woke", s.last_seq(), s.synced_at_ms, extra);
             handed_over += batch.len();
-            deliver(&s, &batch, &a).await?;
             cursor = cursor.max(upto);
-            s.mark_handled(cursor)?;
+            if save {
+                s.mark_handled(cursor)?;
+            }
             if a.once {
                 return Ok(0);
             }
             continue;
         }
         cursor = cursor.max(upto);
-        s.mark_handled(cursor)?;
+        if save {
+            s.mark_handled(cursor)?;
+        }
         if s.closed.is_some() {
             stop(&s, "closed", handed_over, skipped.len());
             return Ok(if a.once { 1 } else { 0 });

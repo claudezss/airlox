@@ -845,6 +845,14 @@ def test_listen_always_wakes_for_the_owner(relay, caches):
     p = cli("listen", "--once", "--json", "--after", "0", "--max-hops", "0", "--timeout", "10s", invite=sender,
             cache=caches("coder"))
     assert ask["id"] in [json.loads(line)["id"] for line in p.stdout.splitlines()]
+    # ... for that run only: the saved cursor is where the earlier run left
+    # it (past everything), so nothing wakes again; a cursor past the end is
+    # refused, as it would mute the listener.
+    p = cli("listen", "--once", "--json", "--max-hops", "0", "--timeout", "10s", invite=sender,
+            cache=caches("coder"), check=False)
+    assert p.returncode == 75, p.stderr
+    p = cli("listen", "--once", "--after", "99999", invite=sender, cache=caches("coder"), check=False)
+    assert p.returncode != 0 and "past the latest item" in p.stderr, p.stderr
 
 
 def test_listen_agent_needs_a_conversation_to_wake(tmp_path):
